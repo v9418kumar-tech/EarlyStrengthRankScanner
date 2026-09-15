@@ -1,61 +1,32 @@
 from flask import Flask, jsonify, render_template_string
-import requests
-import os
-import json
-import gzip
-import threading
-import time
+import requests, os, json, gzip, threading, time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 
-# =========================================================
-# SETTINGS
-# =========================================================
-
-UPSTOX_TOKEN = os.getenv(
-    "UPSTOX_ACCESS_TOKEN", ""
-).strip()
-
-BASE_URL = "https://api.upstox.com"
-
-INSTRUMENT_URL = (
-    "https://assets.upstox.com/"
-    "market-quote/instruments/"
-    "exchange/complete.json.gz"
-)
+TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
+BASE = "https://api.upstox.com"
+INSTRUMENT_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
 
 MIN_PRICE = 50.0
+TOP_HISTORY = 250
+DAYS = 20
 
-LIQUIDITY_DAYS = 20
-
-# FINAL WEIGHTS
-GAP_WEIGHT = 0.05
-RECOVERY_WEIGHT = 0.20
-GAIN_WEIGHT = 0.35
-LIVE_TURNOVER_WEIGHT = 0.30
-AVERAGE_TURNOVER_WEIGHT = 0.10
+WGAP = 0.05
+WREC = 0.20
+WGAIN = 0.35
+WLIVE = 0.30
+WAVG = 0.10
 
 IST = ZoneInfo("Asia/Kolkata")
 
 HEADERS = {
     "Accept": "application/json",
-    "Authorization":
-        f"Bearer {UPSTOX_TOKEN}"
+    "Authorization": f"Bearer {TOKEN}"
 }
-
-# Keep requests comfortably below
-# Upstox standard API rate limits.
-HISTORY_DELAY = 0.20
-
-# Retry settings for temporary API problems.
-MAX_RETRIES = 4
-
-# =========================================================
-# STATE
-# =========================================================
 
 STATE = {
     "running": False,
@@ -69,128 +40,80 @@ STATE = {
 
 LOCK = threading.Lock()
 
-# Same-day average turnover cache.
-TURNOVER_CACHE = {
+# Same-day cache.
+HISTORY_CACHE = {
     "date": None,
     "data": {}
 }
 
 
-# =========================================================
-# BASIC
-# =========================================================
-
-def now_ist():
+def now():
     return datetime.now(IST)
 
 
-def set_status(text):
+def status(text):
     with LOCK:
         STATE["status"] = text
 
 
-def set_progress(done, total):
+def progress(done, total):
     with LOCK:
         STATE["progress"] = done
         STATE["total"] = total
 
 
-def clamp(value, low=0.0, high=100.0):
-    return max(low, min(high, value))
+def clamp(x):
+    return max(0.0, min(100.0, x))
 
 
-# =========================================================
+# ---------------------------------------------------------
 # SCORE FUNCTIONS
-# =========================================================
+# ---------------------------------------------------------
 
-def gap_score(open_price, low_price):
+def gap_score(o, l):
+    if o <= 0:
+        return 0
+    gap = ((o - l) / o) * 100
+    return clamp((1 - gap / 0.50) * 100)
 
-    if open_price <= 0:
-        return 0.0
 
-    gap = (
-        (open_price - low_price)
-        / open_price
-    ) * 100.0
+def recovery_score(c, l):
+    if l <= 0:
+        return 0
+    recovery = ((c - l) / l) * 100
+    return clamp((recovery / 1.50) * 100)
 
+
+def gain_score(c, pc):
+    if pc <= 0:
+        return 0
+    gain = ((c - pc) / pc) * 100
+    return clamp((gain / 3.00) * 100)
+
+
+def live_score(live_turnover, avg_turnover):
+    if avg_turnover <= 0:
+        return 0
     return clamp(
-        (1.0 - gap / 0.50) * 100.0
+        live_turnover /
+        (avg_turnover * 2.5) * 100
     )
 
 
-def recovery_score(
-    current_price,
-    low_price
-):
-
-    if low_price <= 0:
-        return 0.0
-
-    recovery = (
-        (current_price - low_price)
-        / low_price
-    ) * 100.0
-
+def avg_score(avg_turnover):
     return clamp(
-        (recovery / 1.50) * 100.0
+        avg_turnover /
+        100000000 * 100
     )
 
 
-def gain_score(
-    current_price,
-    previous_close
-):
+# ---------------------------------------------------------
+# INSTRUMENTS
+# ---------------------------------------------------------
 
-    if previous_close <= 0:
-        return 0.0
+def instruments():
 
-    gain = (
-        (current_price - previous_close)
-        / previous_close
-    ) * 100.0
-
-    return clamp(
-        (gain / 3.00) * 100.0
-    )
-
-
-def live_turnover_score(
-    live_turnover,
-    average_turnover
-):
-
-    if average_turnover <= 0:
-        return 0.0
-
-    return clamp(
-        (
-            live_turnover
-            / (average_turnover * 2.5)
-        ) * 100.0
-    )
-
-
-def average_turnover_score(
-    average_turnover
-):
-
-    return clamp(
-        (
-            average_turnover
-            / 100000000.0
-        ) * 100.0
-    )
-
-
-# =========================================================
-# UPSTOX INSTRUMENTS
-# =========================================================
-
-def load_instruments():
-
-    set_status(
-        "NSE Equity list Upstox से आ रही है..."
-    )
+    status("Upstox NSE Equity list download हो रही है...")
 
     r = requests.get(
         INSTRUMENT_URL,
@@ -198,514 +121,322 @@ def load_instruments():
     )
 
     if r.status_code != 200:
-
         raise RuntimeError(
-            "Instrument list error "
-            f"{r.status_code}"
+            f"Instrument list error {r.status_code}"
         )
 
-    try:
-
-        raw = gzip.decompress(
-            r.content
-        )
-
-        data = json.loads(
-            raw.decode("utf-8")
-        )
-
-    except Exception as e:
-
-        raise RuntimeError(
-            "Instrument list पढ़ने में error: "
-            + str(e)
-        )
+    raw = gzip.decompress(r.content)
+    data = json.loads(raw.decode("utf-8"))
 
     stocks = []
 
-    for item in data:
+    for x in data:
 
-        if item.get("segment") != "NSE_EQ":
+        if x.get("segment") != "NSE_EQ":
             continue
 
-        if item.get("instrument_type") != "EQ":
+        if x.get("instrument_type") != "EQ":
             continue
 
-        key = item.get(
-            "instrument_key"
-        )
+        key = x.get("instrument_key")
+        symbol = x.get("trading_symbol")
 
-        symbol = item.get(
-            "trading_symbol"
-        )
-
-        if not key or not symbol:
-            continue
-
-        stocks.append({
-            "key": key,
-            "symbol": symbol
-        })
+        if key and symbol:
+            stocks.append({
+                "key": key,
+                "symbol": symbol
+            })
 
     if not stocks:
-
         raise RuntimeError(
-            "NSE EQ instruments नहीं मिले."
+            "NSE EQ instruments नहीं मिले"
         )
 
     return stocks
 
 
-# =========================================================
+# ---------------------------------------------------------
 # LIVE QUOTES
-# =========================================================
+# ---------------------------------------------------------
 
-def get_live_quotes(stocks):
+def live_quotes(stocks):
 
-    quotes = {}
-
+    result = {}
     total = len(stocks)
 
-    for start in range(
-        0,
-        total,
-        500
-    ):
+    for start in range(0, total, 500):
 
-        batch = stocks[
-            start:start + 500
-        ]
+        batch = stocks[start:start + 500]
 
-        end_number = min(
-            start + 500,
-            total
-        )
-
-        set_status(
-            f"Live data: "
-            f"{end_number}/{total}"
+        status(
+            f"Live market data: "
+            f"{min(start + 500,total)}/{total}"
         )
 
         keys = ",".join(
-            x["key"]
-            for x in batch
+            x["key"] for x in batch
         )
 
         url = (
-            BASE_URL
-            + "/v3/market-quote/quotes"
+            BASE +
+            "/v3/market-quote/quotes"
         )
 
-        success = False
+        for attempt in range(4):
 
-        for attempt in range(
-            MAX_RETRIES
-        ):
+            r = requests.get(
+                url,
+                headers=HEADERS,
+                params={
+                    "instrument_key": keys
+                },
+                timeout=45
+            )
 
-            try:
-
-                response = requests.get(
-                    url,
-                    headers=HEADERS,
-                    params={
-                        "instrument_key": keys
-                    },
-                    timeout=45
+            if r.status_code == 200:
+                data = r.json().get(
+                    "data", {}
                 )
 
-                if response.status_code == 200:
+                result.update(data)
+                break
 
-                    payload = response.json()
-
-                    data = payload.get(
-                        "data",
-                        {}
-                    )
-
-                    for response_key, value in (
-                        data.items()
-                    ):
-
-                        if isinstance(
-                            value,
-                            dict
-                        ):
-
-                            quotes[
-                                response_key
-                            ] = value
-
-                    success = True
-                    break
-
-                if response.status_code == 429:
-
-                    wait = 5 + (
-                        attempt * 5
-                    )
-
-                    set_status(
-                        "Upstox rate limit — "
-                        f"{wait} sec wait..."
-                    )
-
-                    time.sleep(wait)
-                    continue
-
-                raise RuntimeError(
-                    "Upstox quote error "
-                    f"{response.status_code}: "
-                    f"{response.text[:300]}"
-                )
-
-            except requests.RequestException as e:
-
-                if attempt == (
-                    MAX_RETRIES - 1
-                ):
-
-                    raise RuntimeError(
-                        "Upstox connection error: "
-                        + str(e)
-                    )
-
-                time.sleep(
-                    3 + attempt * 2
-                )
-
-        if not success:
+            if r.status_code == 429:
+                time.sleep(5 + attempt * 5)
+                continue
 
             raise RuntimeError(
-                "Live quote batch complete "
-                "नहीं हो पाया."
+                f"Upstox quote error "
+                f"{r.status_code}: "
+                f"{r.text[:250]}"
             )
 
         time.sleep(0.15)
 
-    if not quotes:
-
-        raise RuntimeError(
-            "Upstox से कोई live quote नहीं मिला."
-        )
-
-    return quotes
-
-
-# =========================================================
-# HISTORICAL DAILY DATA
-# =========================================================
-
-def get_history_for_stock(
-    instrument_key
-):
-
-    today = now_ist().date()
-
-    # We deliberately go back enough days
-    # to collect at least 20 trading sessions.
-    to_date = (
-        today - timedelta(days=1)
-    )
-
-    from_date = (
-        today - timedelta(days=55)
-    )
-
-    key_encoded = quote(
-        instrument_key,
-        safe=""
-    )
-
-    url = (
-        BASE_URL
-        + "/v3/historical-candle/"
-        + key_encoded
-        + "/days/1/"
-        + to_date.strftime("%Y-%m-%d")
-        + "/"
-        + from_date.strftime("%Y-%m-%d")
-    )
-
-    for attempt in range(
-        MAX_RETRIES
-    ):
-
-        try:
-
-            response = requests.get(
-                url,
-                headers=HEADERS,
-                timeout=45
-            )
-
-            if response.status_code == 200:
-
-                payload = response.json()
-
-                candles = (
-                    payload
-                    .get("data", {})
-                    .get("candles", [])
-                )
-
-                return candles
-
-            if response.status_code == 429:
-
-                wait = 5 + (
-                    attempt * 5
-                )
-
-                time.sleep(wait)
-                continue
-
-            # A single stock failure should
-            # not stop the complete scanner.
-            return []
-
-        except requests.RequestException:
-
-            if attempt == (
-                MAX_RETRIES - 1
-            ):
-
-                return []
-
-            time.sleep(
-                3 + attempt * 2
-            )
-
-    return []
-
-
-# =========================================================
-# 20-DAY AVERAGE TURNOVER
-# =========================================================
-
-def calculate_average_turnover(
-    candles
-):
-
-    if not candles:
-        return None
-
-    rows = []
-
-    for candle in candles:
-
-        if not isinstance(
-            candle,
-            list
-        ):
-            continue
-
-        if len(candle) < 6:
-            continue
-
-        try:
-
-            timestamp = candle[0]
-
-            close_price = float(
-                candle[4]
-            )
-
-            volume = float(
-                candle[5]
-            )
-
-            if close_price <= 0:
-                continue
-
-            if volume <= 0:
-                continue
-
-            turnover = (
-                close_price * volume
-            )
-
-            rows.append({
-                "timestamp":
-                    timestamp,
-                "turnover":
-                    turnover
-            })
-
-        except Exception:
-
-            continue
-
-    if not rows:
-        return None
-
-    # Sort by date newest first.
-    rows.sort(
-        key=lambda x:
-            x["timestamp"],
-        reverse=True
-    )
-
-    rows = rows[
-        :LIQUIDITY_DAYS
-    ]
-
-    if len(rows) < LIQUIDITY_DAYS:
-        return None
-
-    total = sum(
-        x["turnover"]
-        for x in rows
-    )
-
-    return (
-        total
-        / LIQUIDITY_DAYS
-    )
-
-
-def get_all_average_turnovers(
-    candidates
-):
-
-    today = now_ist().date()
-
-    # Use same-day cache.
-    if (
-        TURNOVER_CACHE["date"] == today
-        and TURNOVER_CACHE["data"]
-    ):
-
-        set_status(
-            "20-Day turnover cache से लिया जा रहा है..."
-        )
-
-        return TURNOVER_CACHE["data"]
-
-    result = {}
-
-    total = len(candidates)
-
-    set_status(
-        f"20-Day data शुरू: "
-        f"0/{total}"
-    )
-
-    for index, stock in enumerate(
-        candidates,
-        1
-    ):
-
-        symbol = stock["symbol"]
-        key = stock["key"]
-
-        candles = get_history_for_stock(
-            key
-        )
-
-        average = (
-            calculate_average_turnover(
-                candles
-            )
-        )
-
-        if average is not None:
-
-            result[symbol] = average
-
-        set_progress(
-            index,
-            total
-        )
-
-        set_status(
-            f"20-Day turnover: "
-            f"{index}/{total} • "
-            f"{symbol}"
-        )
-
-        # Keep well below the
-        # 500/minute standard limit.
-        time.sleep(
-            HISTORY_DELAY
-        )
-
     if not result:
-
         raise RuntimeError(
-            "किसी भी stock का "
-            "20-Day historical data नहीं मिला."
+            "Live quotes नहीं मिले"
         )
-
-    TURNOVER_CACHE["date"] = today
-    TURNOVER_CACHE["data"] = result
 
     return result
 
 
-# =========================================================
-# MAIN SCAN
-# =========================================================
+# ---------------------------------------------------------
+# HISTORICAL 20 DAY DATA
+# ---------------------------------------------------------
 
-def perform_scan():
+def history_one(stock):
+
+    key = stock["key"]
+    symbol = stock["symbol"]
+
+    today = now().date()
+
+    to_date = today - timedelta(days=1)
+    from_date = today - timedelta(days=55)
+
+    encoded = quote(
+        key,
+        safe=""
+    )
+
+    url = (
+        BASE +
+        "/v3/historical-candle/" +
+        encoded +
+        "/days/1/" +
+        to_date.strftime("%Y-%m-%d") +
+        "/" +
+        from_date.strftime("%Y-%m-%d")
+    )
+
+    try:
+
+        for attempt in range(4):
+
+            r = requests.get(
+                url,
+                headers=HEADERS,
+                timeout=40
+            )
+
+            if r.status_code == 200:
+
+                candles = (
+                    r.json()
+                    .get("data", {})
+                    .get("candles", [])
+                )
+
+                rows = []
+
+                for candle in candles:
+
+                    if len(candle) < 6:
+                        continue
+
+                    try:
+
+                        close = float(candle[4])
+                        volume = float(candle[5])
+
+                        if close > 0 and volume > 0:
+
+                            rows.append(
+                                close * volume
+                            )
+
+                    except:
+                        continue
+
+                if len(rows) >= DAYS:
+
+                    rows = rows[:DAYS]
+
+                    average = (
+                        sum(rows) / DAYS
+                    )
+
+                    return symbol, average
+
+                return symbol, None
+
+            if r.status_code == 429:
+
+                time.sleep(
+                    5 + attempt * 5
+                )
+
+                continue
+
+            return symbol, None
+
+    except Exception:
+
+        return symbol, None
+
+    return symbol, None
+
+
+def historical_top(candidates):
+
+    today = now().date()
+
+    if (
+        HISTORY_CACHE["date"] == today
+        and HISTORY_CACHE["data"]
+    ):
+
+        status(
+            "20-Day turnover cache से लिया जा रहा है..."
+        )
+
+        return HISTORY_CACHE["data"]
+
+    total = len(candidates)
+
+    status(
+        f"Top {total} shares का 20-Day data..."
+    )
+
+    result = {}
+    done = 0
+
+    # Six parallel workers.
+    # This keeps request speed high while
+    # staying around normal API capacity.
+    with ThreadPoolExecutor(
+        max_workers=6
+    ) as executor:
+
+        futures = [
+            executor.submit(
+                history_one,
+                stock
+            )
+            for stock in candidates
+        ]
+
+        for future in as_completed(
+            futures
+        ):
+
+            symbol, average = (
+                future.result()
+            )
+
+            if average:
+                result[symbol] = average
+
+            done += 1
+
+            progress(
+                done,
+                total
+            )
+
+            status(
+                f"20-Day turnover: "
+                f"{done}/{total} • {symbol}"
+            )
+
+    if not result:
+        raise RuntimeError(
+            "20-Day historical data नहीं मिला"
+        )
+
+    HISTORY_CACHE["date"] = today
+    HISTORY_CACHE["data"] = result
+
+    return result
+
+
+# ---------------------------------------------------------
+# MAIN SCAN
+# ---------------------------------------------------------
+
+def scan():
 
     with LOCK:
 
         STATE["running"] = True
-        STATE["status"] = (
-            "Scan शुरू हो रहा है..."
-        )
-        STATE["last_scan"] = None
+        STATE["status"] = "Scan शुरू हो रहा है..."
         STATE["results"] = []
         STATE["error"] = None
+        STATE["last_scan"] = None
         STATE["progress"] = 0
         STATE["total"] = 0
 
     try:
 
-        if not UPSTOX_TOKEN:
+        if not TOKEN:
 
             raise RuntimeError(
-                "UPSTOX_ACCESS_TOKEN Render "
-                "Environment में नहीं मिला."
+                "UPSTOX_ACCESS_TOKEN Render Environment में नहीं मिला"
             )
 
-        # -----------------------------------------
-        # 1. INSTRUMENTS
-        # -----------------------------------------
+        # 1. Instruments
+        stocks = instruments()
 
-        stocks = load_instruments()
+        # 2. Live quotes
+        quotes = live_quotes(stocks)
 
-        # -----------------------------------------
-        # 2. LIVE QUOTES
-        # -----------------------------------------
+        # -------------------------------------------------
+        # 3. PRELIMINARY SCORE
+        # -------------------------------------------------
 
-        quotes = get_live_quotes(
-            stocks
+        status(
+            "Fast preliminary ranking बन रही है..."
         )
 
-        # -----------------------------------------
-        # 3. FIRST FILTER
-        # -----------------------------------------
-        #
-        # Only Price >= ₹50.
-        #
-        # Average turnover is NOT a hard filter.
-        # It contributes only 10% score.
-        #
-
-        candidates = []
+        preliminary = []
 
         for stock in stocks:
 
             symbol = stock["symbol"]
 
-            quote_key = (
-                "NSE_EQ:"
-                + symbol
-            )
-
             q = quotes.get(
-                quote_key
+                "NSE_EQ:" + symbol
             )
 
             if not q:
@@ -714,202 +445,191 @@ def perform_scan():
             try:
 
                 ltp = float(
+                    q["last_price"]
+                )
+
+                pc = float(
+                    q["prev_close_price"]
+                )
+
+                ohlc = q.get(
+                    "ohlc", {}
+                ) or {}
+
+                op = float(
+                    ohlc["open"]
+                )
+
+                low = float(
+                    ohlc["low"]
+                )
+
+                vol = float(
                     q.get(
-                        "last_price"
+                        "volume",
+                        0
                     )
                 )
 
-            except Exception:
+            except:
 
                 continue
 
             if ltp < MIN_PRICE:
                 continue
 
-            candidates.append(
-                stock
+            if op <= 0 or low <= 0 or pc <= 0:
+                continue
+
+            sg = gap_score(
+                op,
+                low
             )
 
-        if not candidates:
+            sr = recovery_score(
+                ltp,
+                low
+            )
+
+            sgain = gain_score(
+                ltp,
+                pc
+            )
+
+            # Average-turnover component is
+            # temporarily neutral.
+            #
+            # It will be added after historical
+            # data is obtained for the strongest
+            # candidates.
+
+            live_turnover = vol * ltp
+
+            # Preliminary score = 90%
+            preliminary_score = (
+                sg * WGAP
+                + sr * WREC
+                + sgain * WGAIN
+                + clamp(
+                    live_turnover /
+                    250000000 * 100
+                ) * WLIVE
+            )
+
+            preliminary.append({
+
+                "stock": stock,
+
+                "symbol": symbol,
+
+                "ltp": ltp,
+
+                "pc": pc,
+
+                "open": op,
+
+                "low": low,
+
+                "volume": vol,
+
+                "gap": sg,
+
+                "recovery": sr,
+
+                "gain": sgain,
+
+                "live_turnover":
+                    live_turnover,
+
+                "preliminary":
+                    preliminary_score
+            })
+
+        if not preliminary:
 
             raise RuntimeError(
-                "₹50 या उससे ऊपर का "
-                "कोई NSE EQ stock नहीं मिला."
+                "₹50+ वाले live candidates नहीं मिले"
             )
 
-        set_status(
-            f"₹50+ candidates: "
-            f"{len(candidates)}"
+        preliminary.sort(
+            key=lambda x:
+                x["preliminary"],
+            reverse=True
         )
 
-        # -----------------------------------------
-        # 4. 20-DAY HISTORICAL TURNOVER
-        # -----------------------------------------
+        # -------------------------------------------------
+        # 4. ONLY TOP 250 HISTORICAL DATA
+        # -------------------------------------------------
+
+        top = preliminary[
+            :TOP_HISTORY
+        ]
+
+        candidates = [
+            x["stock"]
+            for x in top
+        ]
 
         average_turnovers = (
-            get_all_average_turnovers(
+            historical_top(
                 candidates
             )
         )
 
-        # -----------------------------------------
+        # -------------------------------------------------
         # 5. FINAL SCORE
-        # -----------------------------------------
+        # -------------------------------------------------
 
-        set_status(
-            "Final Strength Rank calculate हो रही है..."
+        status(
+            "Final Strength Ranking तैयार हो रही है..."
         )
 
         results = []
 
-        total_candidates = len(
-            candidates
-        )
+        for x in top:
 
-        for index, stock in enumerate(
-            candidates,
-            1
-        ):
+            symbol = x["symbol"]
 
-            symbol = stock[
-                "symbol"
-            ]
-
-            quote_key = (
-                "NSE_EQ:"
-                + symbol
-            )
-
-            q = quotes.get(
-                quote_key
-            )
-
-            if not q:
-                continue
-
-            try:
-
-                ltp = float(
-                    q.get(
-                        "last_price"
-                    )
-                )
-
-                previous_close = float(
-                    q.get(
-                        "prev_close_price"
-                    )
-                )
-
-                ohlc = q.get(
-                    "ohlc",
-                    {}
-                ) or {}
-
-                open_price = float(
-                    ohlc.get(
-                        "open"
-                    )
-                )
-
-                low_price = float(
-                    ohlc.get(
-                        "low"
-                    )
-                )
-
-                volume = float(
-                    q.get(
-                        "volume",
-                        0
-                    ) or 0
-                )
-
-            except Exception:
-
-                continue
-
-            average_turnover = (
+            average = (
                 average_turnovers.get(
                     symbol
                 )
             )
 
-            if not average_turnover:
+            if not average:
                 continue
 
-            if (
-                open_price <= 0
-                or low_price <= 0
-                or previous_close <= 0
-            ):
-                continue
-
-            # ---------------------------------
-            # COMPONENT SCORES
-            # ---------------------------------
-
-            s_gap = gap_score(
-                open_price,
-                low_price
+            savg = avg_score(
+                average
             )
 
-            s_recovery = recovery_score(
-                ltp,
-                low_price
+            slive = live_score(
+                x["live_turnover"],
+                average
             )
 
-            s_gain = gain_score(
-                ltp,
-                previous_close
-            )
+            final_score = (
 
-            live_turnover = (
-                volume * ltp
-            )
+                x["gap"]
+                * WGAP
 
-            s_live = (
-                live_turnover_score(
-                    live_turnover,
-                    average_turnover
-                )
-            )
+                + x["recovery"]
+                * WREC
 
-            s_average = (
-                average_turnover_score(
-                    average_turnover
-                )
-            )
+                + x["gain"]
+                * WGAIN
 
-            # ---------------------------------
-            # FINAL SCORE
-            # ---------------------------------
+                + slive
+                * WLIVE
 
-            strength = (
-
-                s_gap
-                * GAP_WEIGHT
-
-                + s_recovery
-                * RECOVERY_WEIGHT
-
-                + s_gain
-                * GAIN_WEIGHT
-
-                + s_live
-                * LIVE_TURNOVER_WEIGHT
-
-                + s_average
-                * AVERAGE_TURNOVER_WEIGHT
+                + savg
+                * WAVG
             )
 
             gain_percent = (
-                (
-                    ltp
-                    - previous_close
-                )
-                / previous_close
-            ) * 100.0
+                (x["ltp"] - x["pc"])
+                / x["pc"]
+            ) * 100
 
             results.append({
 
@@ -918,25 +638,25 @@ def perform_scan():
 
                 "strength":
                     round(
-                        strength,
+                        final_score,
                         2
                     ),
 
                 "ltp":
                     round(
-                        ltp,
+                        x["ltp"],
                         2
                     ),
 
                 "open":
                     round(
-                        open_price,
+                        x["open"],
                         2
                     ),
 
                 "low":
                     round(
-                        low_price,
+                        x["low"],
                         2
                     ),
 
@@ -946,51 +666,12 @@ def perform_scan():
                         2
                     ),
 
-                "gap_score":
+                "avg_turnover":
                     round(
-                        s_gap,
-                        2
-                    ),
-
-                "recovery_score":
-                    round(
-                        s_recovery,
-                        2
-                    ),
-
-                "gain_score":
-                    round(
-                        s_gain,
-                        2
-                    ),
-
-                "live_score":
-                    round(
-                        s_live,
-                        2
-                    ),
-
-                "average_score":
-                    round(
-                        s_average,
-                        2
-                    ),
-
-                "average_turnover":
-                    round(
-                        average_turnover,
+                        average,
                         0
                     )
             })
-
-            set_progress(
-                index,
-                total_candidates
-            )
-
-        # -----------------------------------------
-        # 6. SORT
-        # -----------------------------------------
 
         results.sort(
             key=lambda x:
@@ -998,39 +679,34 @@ def perform_scan():
             reverse=True
         )
 
-        # Add rank
-        for rank, item in enumerate(
+        for i, x in enumerate(
             results,
             1
         ):
 
-            item["rank"] = rank
-
-        # -----------------------------------------
-        # 7. SAVE
-        # -----------------------------------------
+            x["rank"] = i
 
         with LOCK:
 
             STATE["results"] = results
 
             STATE["last_scan"] = (
-                now_ist().strftime(
+                now().strftime(
                     "%d-%m-%Y %H:%M:%S"
                 )
             )
 
             STATE["status"] = (
-                "Scan complete — "
+                f"Scan complete — "
                 f"{len(results)} stocks found"
             )
 
             STATE["progress"] = (
-                total_candidates
+                len(candidates)
             )
 
             STATE["total"] = (
-                total_candidates
+                len(candidates)
             )
 
     except Exception as e:
@@ -1046,17 +722,15 @@ def perform_scan():
     finally:
 
         with LOCK:
-
             STATE["running"] = False
 
 
-# =========================================================
+# ---------------------------------------------------------
 # HTML
-# =========================================================
+# ---------------------------------------------------------
 
-HTML = r"""
+HTML = """
 <!DOCTYPE html>
-
 <html lang="hi">
 
 <head>
@@ -1066,9 +740,7 @@ HTML = r"""
 <meta name="viewport"
 content="width=device-width,initial-scale=1.0">
 
-<title>
-Early Strength Rank Scanner
-</title>
+<title>Early Strength Rank Scanner</title>
 
 <style>
 
@@ -1089,8 +761,7 @@ max-width:1000px;
 margin:auto;
 }
 
-.header,
-.panel{
+.header,.panel{
 background:#151d26;
 border:1px solid #27313c;
 border-radius:18px;
@@ -1128,7 +799,7 @@ margin-top:12px;
 height:100%;
 width:0%;
 background:#3b82f6;
-transition:width .4s;
+transition:width .3s;
 }
 
 button{
@@ -1180,11 +851,10 @@ overflow-x:auto;
 table{
 width:100%;
 border-collapse:collapse;
-min-width:700px;
+min-width:650px;
 }
 
-th,
-td{
+th,td{
 padding:12px 10px;
 border-bottom:1px solid #27313c;
 text-align:left;
@@ -1216,7 +886,6 @@ line-height:1.5;
 
 <div class="container">
 
-
 <div class="header">
 
 <h1>
@@ -1244,7 +913,7 @@ Last Scan:
 
 <div class="progress">
 
-<div id="progressbar"
+<div id="bar"
 class="progressbar">
 </div>
 
@@ -1252,12 +921,9 @@ class="progressbar">
 
 <br>
 
-<button
-id="scanBtn"
+<button id="scanBtn"
 onclick="startScan()">
-
 Scan Now
-
 </button>
 
 <div id="error"></div>
@@ -1267,84 +933,35 @@ Scan Now
 
 <div class="weights">
 
+<div class="box">
+<div class="label">Price</div>
+<div class="value">≥ ₹50</div>
+</div>
 
 <div class="box">
-
-<div class="label">
-Price
+<div class="label">Gap Weight</div>
+<div class="value">5%</div>
 </div>
-
-<div class="value">
-≥ ₹50
-</div>
-
-</div>
-
 
 <div class="box">
-
-<div class="label">
-Gap Weight
+<div class="label">Recovery</div>
+<div class="value">20%</div>
 </div>
-
-<div class="value">
-5%
-</div>
-
-</div>
-
 
 <div class="box">
-
-<div class="label">
-Recovery
+<div class="label">Gain</div>
+<div class="value">35%</div>
 </div>
-
-<div class="value">
-20%
-</div>
-
-</div>
-
 
 <div class="box">
-
-<div class="label">
-Gain
+<div class="label">Live Turnover</div>
+<div class="value">30%</div>
 </div>
-
-<div class="value">
-35%
-</div>
-
-</div>
-
 
 <div class="box">
-
-<div class="label">
-Live Turnover
+<div class="label">Average Turnover</div>
+<div class="value">10%</div>
 </div>
-
-<div class="value">
-30%
-</div>
-
-</div>
-
-
-<div class="box">
-
-<div class="label">
-Average Turnover
-</div>
-
-<div class="value">
-10%
-</div>
-
-</div>
-
 
 </div>
 
@@ -1352,14 +969,8 @@ Average Turnover
 <div class="panel">
 
 <div class="results-title">
-
-Results:
-<span id="count">
-0
-</span>
-
+Results: <span id="count">0</span>
 </div>
-
 
 <div class="table-wrap">
 
@@ -1368,48 +979,23 @@ Results:
 <thead>
 
 <tr>
-
-<th>
-Rank
-</th>
-
-<th>
-Share
-</th>
-
-<th>
-Strength
-</th>
-
-<th>
-LTP
-</th>
-
-<th>
-Open
-</th>
-
-<th>
-Low
-</th>
-
-<th>
-Gain
-</th>
-
+<th>Rank</th>
+<th>Share</th>
+<th>Strength</th>
+<th>LTP</th>
+<th>Open</th>
+<th>Low</th>
+<th>Gain</th>
 </tr>
 
 </thead>
 
-
 <tbody id="tbody">
 
 <tr>
-
 <td colspan="7">
 कोई result नहीं
 </td>
-
 </tr>
 
 </tbody>
@@ -1423,186 +1009,121 @@ Gain
 
 <div class="panel">
 
-<h2>
-Ranking Logic
-</h2>
+<h2>Ranking Logic</h2>
 
-<p>
-• NSE Equity shares only
-</p>
-
-<p>
-• Price ≥ ₹50
-</p>
-
-<p>
-• Open-Low Gap = 5%
-</p>
-
-<p>
-• Recovery = 20%
-</p>
-
-<p>
-• Gain = 35%
-</p>
-
-<p>
-• Live Turnover = 30%
-</p>
-
-<p>
-• Average Turnover = 10%
-</p>
+<p>• NSE Equity shares only</p>
+<p>• Price ≥ ₹50</p>
+<p>• Open-Low Gap = 5%</p>
+<p>• Recovery = 20%</p>
+<p>• Gain = 35%</p>
+<p>• Live Turnover = 30%</p>
+<p>• Average Turnover = 10%</p>
 
 <p class="note">
-20-Day Average Turnover अब अलग hard filter नहीं है।
-यह केवल 10% score component है।
+Fast scan में पहले strongest live candidates
+निकाले जाते हैं। 20-Day Average Turnover
+केवल Top 250 candidates पर calculate होता है,
+जिससे scanner बहुत तेज चलता है।
 </p>
 
 </div>
-
 
 </div>
 
 
 <script>
 
-async function loadResults(){
+async function load(){
 
 try{
 
-const response =
-await fetch(
+const r=await fetch(
 "/api/results",
-{
-cache:"no-store"
-}
+{cache:"no-store"}
 );
 
-const data =
-await response.json();
-
+const d=await r.json();
 
 document.getElementById(
 "status"
-).innerText =
-data.status || "Ready";
-
+).innerText=
+d.status||"Ready";
 
 document.getElementById(
 "lastScan"
-).innerText =
-data.last_scan || "--";
-
+).innerText=
+d.last_scan||"--";
 
 document.getElementById(
 "count"
-).innerText =
-data.results
-? data.results.length
-: 0;
+).innerText=
+d.results?d.results.length:0;
 
+document.getElementById(
+"scanBtn"
+).disabled=d.running;
 
-const errorBox =
+if(d.error){
+
 document.getElementById(
 "error"
-);
-
-
-if(data.error){
-
-errorBox.innerHTML =
-'<div class="error">'
-+
-data.error
-+
+).innerHTML=
+'<div class="error">'+
+d.error+
 '</div>';
 
 }else{
 
-errorBox.innerHTML =
-"";
-
+document.getElementById(
+"error"
+).innerHTML="";
 }
 
+let p=0;
 
-const button =
-document.getElementById(
-"scanBtn"
-);
+if(d.total>0){
 
-button.disabled =
-data.running;
-
-
-let percent = 0;
-
-if(
-data.total &&
-data.total > 0
-){
-
-percent =
-(
-data.progress
-/
-data.total
-) * 100;
+p=(d.progress/d.total)*100;
 
 }
 
 document.getElementById(
-"progressbar"
-).style.width =
-percent + "%";
+"bar"
+).style.width=
+p+"%";
 
 
-const tbody =
+const tbody=
 document.getElementById(
 "tbody"
 );
 
+if(!d.results||
+d.results.length===0){
 
-if(
-!data.results ||
-data.results.length === 0
-){
-
-tbody.innerHTML =
-'<tr>' +
-'<td colspan="7">' +
-'कोई result नहीं' +
-'</td>' +
-'</tr>';
+tbody.innerHTML=
+'<tr><td colspan="7">'+
+'कोई result नहीं'+
+'</td></tr>';
 
 return;
-
 }
 
-
-tbody.innerHTML =
-data.results.map(
-x => `
+tbody.innerHTML=
+d.results.map(x=>`
 
 <tr>
 
 <td>
-<strong>
-${x.rank}
-</strong>
+<strong>${x.rank}</strong>
 </td>
 
 <td>
-<strong>
-${x.symbol}
-</strong>
+<strong>${x.symbol}</strong>
 </td>
 
 <td>
-<strong>
-${x.strength}
-</strong>
+<strong>${x.strength}</strong>
 </td>
 
 <td>
@@ -1623,16 +1144,14 @@ ${x.gain}%
 
 </tr>
 
-`
-).join("");
+`).join("");
 
-
-}catch(error){
+}catch(e){
 
 document.getElementById(
 "status"
-).innerText =
-"Server response नहीं मिला.";
+).innerText=
+"Server response नहीं मिला";
 
 }
 
@@ -1641,25 +1160,18 @@ document.getElementById(
 
 async function startScan(){
 
-const button =
 document.getElementById(
 "scanBtn"
-);
-
-button.disabled = true;
-
+).disabled=true;
 
 document.getElementById(
 "status"
-).innerText =
+).innerText=
 "Scan शुरू हो रहा है...";
-
 
 document.getElementById(
 "error"
-).innerHTML =
-"";
-
+).innerHTML="";
 
 try{
 
@@ -1670,27 +1182,26 @@ method:"POST"
 }
 );
 
-}catch(error){
+}catch(e){
 
 document.getElementById(
 "status"
-).innerText =
-"Scan request failed.";
+).innerText=
+"Scan request failed";
 
 }
 
 }
 
 
-loadResults();
+load();
 
 setInterval(
-loadResults,
+load,
 1500
 );
 
 </script>
-
 
 </body>
 
@@ -1698,16 +1209,13 @@ loadResults,
 """
 
 
-# =========================================================
+# ---------------------------------------------------------
 # ROUTES
-# =========================================================
+# ---------------------------------------------------------
 
 @app.route("/")
 def home():
-
-    return render_template_string(
-        HTML
-    )
+    return render_template_string(HTML)
 
 
 @app.route(
@@ -1726,27 +1234,22 @@ def api_scan():
                     "Scan already running"
             })
 
-    thread = threading.Thread(
-        target=perform_scan,
+    threading.Thread(
+        target=scan,
         daemon=True
-    )
-
-    thread.start()
+    ).start()
 
     return jsonify({
         "ok": True
     })
 
 
-@app.route(
-    "/api/results"
-)
+@app.route("/api/results")
 def api_results():
 
     with LOCK:
 
         return jsonify({
-
             "running":
                 STATE["running"],
 
@@ -1769,10 +1272,6 @@ def api_results():
                 STATE["total"]
         })
 
-
-# =========================================================
-# START
-# =========================================================
 
 if __name__ == "__main__":
 
