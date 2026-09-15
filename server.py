@@ -1,11 +1,12 @@
-from flask import Flask, jsonify, send_from_directory
+from flask import Flask, jsonify, render_template_string
 import requests
-import os
-import json
 import gzip
-import threading
+import json
+import os
 import time
-from datetime import datetime, timedelta
+import threading
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
@@ -14,1005 +15,698 @@ app = Flask(__name__)
 # SETTINGS
 # ============================================================
 
-TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
+UPSTOX_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
+
+BASE = "https://api.upstox.com"
+INSTRUMENT_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
 
 MIN_PRICE = 50.0
+LIQUIDITY_DAYS = 20
+MAX_HIST_DAYS = 50
 
-UPSTOX_QUOTE_URL = (
-    "https://api.upstox.com/v3/market-quote/quotes"
-)
-
-UPSTOX_INSTRUMENT_URL = (
-    "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
-)
-
-NSE_BHAV_URL = (
-    "https://nsearchives.nseindia.com/products/"
-    "content/sec_bhavdata_full_{}.csv"
-)
+# Minimum average turnover filter
+MIN_AVG_TURNOVER = 100_000_000.0   # ₹10 Crore
 
 # ============================================================
-# STATE
+# FINAL WEIGHTS
+# ============================================================
+
+WEIGHT_GAP = 0.05
+WEIGHT_RECOVERY = 0.20
+WEIGHT_GAIN = 0.35
+WEIGHT_LIVE = 0.30
+WEIGHT_AVG = 0.10
+
+# ============================================================
+# GLOBAL DATA
 # ============================================================
 
 INSTRUMENTS = []
-INSTRUMENT_MAP = {}
+BY_KEY = {}
 
 LIVE_RESULTS = []
+LAST_SCAN_TIME = "--"
+LAST_SCAN_ERROR = ""
 SCAN_RUNNING = False
-LAST_SCAN_TIME = ""
-LAST_ERROR = ""
-
 SCAN_LOCK = threading.Lock()
+
+HIST_CACHE = {}
+CACHE_DATE = ""
+
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def headers():
+def ist_now():
+    return datetime.now(timezone.utc).astimezone(
+        timezone(timedelta(hours=5, minutes=30))
+    )
 
+
+def headers():
     return {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {TOKEN}",
-        "User-Agent": "EarlyStrengthRankScanner/1.0"
+        "Authorization": f"Bearer {UPSTOX_TOKEN}"
     }
 
 
-def chunks(items, size):
+def safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
 
-    for i in range(0, len(items), size):
-        yield items[i:i + size]
 
-
-def clamp(value):
-
-    return max(
-        0.0,
-        min(100.0, float(value))
-    )
+def log(msg):
+    print(f"[{ist_now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
 # ============================================================
-# LOAD UPSTOX NSE EQ INSTRUMENTS
+# LOAD NSE EQUITY INSTRUMENTS
 # ============================================================
 
 def load_instruments():
-
-    global INSTRUMENTS
-    global INSTRUMENT_MAP
+    global INSTRUMENTS, BY_KEY
 
     if INSTRUMENTS:
-        return INSTRUMENTS
+        return
 
-    r = requests.get(
-        UPSTOX_INSTRUMENT_URL,
-        timeout=30
-    )
+    log("Downloading Upstox complete instrument list...")
 
+    r = requests.get(INSTRUMENT_URL, timeout=30)
     r.raise_for_status()
 
-    raw = gzip.decompress(
-        r.content
-    )
+    data = json.loads(gzip.decompress(r.content).decode("utf-8"))
 
-    data = json.loads(
-        raw.decode("utf-8")
-    )
-
-    instruments = []
+    selected = []
 
     for x in data:
-
-        if not isinstance(x, dict):
-            continue
-
-        if x.get("segment") != "NSE_EQ":
-            continue
-
-        if x.get("instrument_type") != "EQ":
-            continue
-
-        key = x.get(
-            "instrument_key"
-        )
-
-        symbol = (
-            x.get("trading_symbol")
-            or x.get("short_name")
-        )
-
-        if not key or not symbol:
-            continue
-
-        instruments.append({
-            "instrument_key": key,
-            "symbol": symbol,
-            "name": x.get(
-                "name",
-                symbol
-            )
-        })
-
-    INSTRUMENTS = instruments
-
-    INSTRUMENT_MAP = {
-        x["instrument_key"]: x
-        for x in instruments
-    }
-
-    print(
-        f"Loaded {len(INSTRUMENTS)} NSE EQ instruments"
-    )
-
-    return INSTRUMENTS
-
-
-# ============================================================
-# LIVE UPSTOX QUOTES
-# ============================================================
-
-def fetch_quote_batch(batch):
-
-    keys = ",".join(
-        x["instrument_key"]
-        for x in batch
-    )
-
-    try:
-
-        r = requests.get(
-            UPSTOX_QUOTE_URL,
-            headers=headers(),
-            params={
-                "instrument_key": keys
-            },
-            timeout=15
-        )
-
-        if r.status_code != 200:
-
-            print(
-                "Quote error:",
-                r.status_code,
-                r.text[:200]
-            )
-
-            return []
-
-        data = r.json().get(
-            "data",
-            {}
-        )
-
-        results = []
-
-        for response_key, q in data.items():
-
-            if not isinstance(q, dict):
+        try:
+            if x.get("segment") != "NSE_EQ":
                 continue
 
-            instrument_key = (
-                q.get(
-                    "instrument_token"
-                )
-                or response_key
-            )
-
-            info = INSTRUMENT_MAP.get(
-                instrument_key
-            )
-
-            if not info:
+            if x.get("instrument_type") != "EQ":
                 continue
 
-            ohlc = q.get(
-                "ohlc",
-                {}
-            )
+            key = x.get("instrument_key")
+            symbol = x.get("trading_symbol")
 
-            open_price = float(
-                ohlc.get(
-                    "open",
-                    0
-                ) or 0
-            )
-
-            low_price = float(
-                ohlc.get(
-                    "low",
-                    0
-                ) or 0
-            )
-
-            current_close = float(
-                q.get(
-                    "last_price",
-                    0
-                ) or 0
-            )
-
-            volume = float(
-                q.get(
-                    "volume",
-                    ohlc.get(
-                        "volume",
-                        0
-                    )
-                )
-                or 0
-            )
-
-            previous_close = float(
-                q.get(
-                    "prev_close_price",
-                    0
-                ) or 0
-            )
-
-            if (
-                open_price <= 0
-                or low_price <= 0
-                or current_close <= 0
-                or previous_close <= 0
-            ):
+            if not key or not symbol:
                 continue
 
-            if current_close < MIN_PRICE:
-                continue
-
-            results.append({
-
-                "symbol":
-                    info["symbol"],
-
-                "name":
-                    info["name"],
-
-                "instrument_key":
-                    instrument_key,
-
-                "open":
-                    open_price,
-
-                "low":
-                    low_price,
-
-                "close":
-                    current_close,
-
-                "volume":
-                    volume,
-
-                "prev_close":
-                    previous_close
-
+            selected.append({
+                "instrument_key": key,
+                "trading_symbol": symbol,
+                "name": x.get("name", "")
             })
 
-        return results
+        except Exception:
+            continue
 
-    except Exception as e:
+    INSTRUMENTS = selected
+    BY_KEY = {x["instrument_key"]: x for x in selected}
 
-        print(
-            "Quote batch error:",
-            repr(e)
-        )
-
-        return []
-
-
-def fetch_all_live_quotes():
-
-    load_instruments()
-
-    all_results = []
-
-    batches = list(
-        chunks(
-            INSTRUMENTS,
-            500
-        )
-    )
-
-    workers = min(
-        6,
-        len(batches)
-    )
-
-    with ThreadPoolExecutor(
-        max_workers=workers
-    ) as executor:
-
-        futures = [
-            executor.submit(
-                fetch_quote_batch,
-                batch
-            )
-            for batch in batches
-        ]
-
-        for future in as_completed(
-            futures
-        ):
-
-            try:
-
-                rows = future.result()
-
-                all_results.extend(
-                    rows
-                )
-
-            except Exception as e:
-
-                print(
-                    "Worker error:",
-                    repr(e)
-                )
-
-    print(
-        f"Live quotes received: {len(all_results)}"
-    )
-
-    return all_results
+    log(f"NSE EQ instruments loaded: {len(INSTRUMENTS)}")
 
 
 # ============================================================
-# NSE SESSION
+# FULL MARKET QUOTES V3
 # ============================================================
 
-def nse_session():
-
-    s = requests.Session()
-
-    s.headers.update({
-
-        "User-Agent":
-            "Mozilla/5.0 "
-            "(Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/139.0 Safari/537.36",
-
-        "Accept":
-            "text/html,application/json,*/*",
-
-        "Accept-Language":
-            "en-US,en;q=0.9",
-
-        "Referer":
-            "https://www.nseindia.com/"
-    })
-
-    try:
-
-        s.get(
-            "https://www.nseindia.com/",
-            timeout=8
-        )
-
-    except Exception:
-        pass
-
-    return s
-
-
-# ============================================================
-# NSE BHAVCOPY
-# ============================================================
-
-def get_bhavcopy(date_obj):
-
-    date_str = date_obj.strftime(
-        "%d%m%Y"
-    )
-
-    url = NSE_BHAV_URL.format(
-        date_str
-    )
-
-    try:
-
-        s = nse_session()
-
-        r = s.get(
-            url,
-            timeout=20
-        )
-
-        if r.status_code != 200:
-            return None
-
-        if not r.text.strip():
-            return None
-
-        text = r.text
-
-        lines = text.splitlines()
-
-        if len(lines) < 2:
-            return None
-
-        header = [
-            x.strip().upper()
-            for x in lines[0].split(",")
-        ]
-
-        symbol_index = None
-        close_index = None
-        volume_index = None
-        turnover_index = None
-        series_index = None
-
-        for i, col in enumerate(header):
-
-            if col == "SYMBOL":
-                symbol_index = i
-
-            elif col == "CLOSE_PRICE":
-                close_index = i
-
-            elif col in (
-                "TTL_TRD_QNTY",
-                "TOTTRDQTY"
-            ):
-                volume_index = i
-
-            elif col == "TOTTRDVAL":
-                turnover_index = i
-
-            elif col == "SERIES":
-                series_index = i
-
-        if (
-            symbol_index is None
-            or close_index is None
-            or series_index is None
-        ):
-            return None
-
-        result = {}
-
-        for line in lines[1:]:
-
-            try:
-
-                parts = [
-                    x.strip()
-                    for x in line.split(",")
-                ]
-
-                if len(parts) <= symbol_index:
-                    continue
-
-                if (
-                    parts[series_index]
-                    .upper()
-                    != "EQ"
-                ):
-                    continue
-
-                symbol = (
-                    parts[symbol_index]
-                    .upper()
-                    .strip()
-                )
-
-                close = float(
-                    parts[close_index]
-                    .replace(",", "")
-                )
-
-                if (
-                    turnover_index
-                    is not None
-                ):
-
-                    turnover = float(
-                        parts[
-                            turnover_index
-                        ].replace(",", "")
-                    )
-
-                elif (
-                    volume_index
-                    is not None
-                ):
-
-                    volume = float(
-                        parts[
-                            volume_index
-                        ].replace(",", "")
-                    )
-
-                    turnover = (
-                        close * volume
-                    )
-
-                else:
-
-                    continue
-
-                if turnover > 0:
-
-                    result[symbol] = {
-                        "close": close,
-                        "turnover": turnover
-                    }
-
-            except Exception:
-                continue
-
-        return result
-
-    except Exception as e:
-
-        print(
-            "Bhavcopy error:",
-            date_obj,
-            repr(e)
-        )
-
-        return None
-
-
-# ============================================================
-# PREVIOUS 20 VALID TRADING DAYS
-# ============================================================
-
-def get_previous_trading_dates():
-
-    dates = []
-
-    d = (
-        datetime.now().date()
-        - timedelta(days=1)
-    )
-
-    while len(dates) < 20:
-
-        if d.weekday() < 5:
-            dates.append(d)
-
-        d -= timedelta(days=1)
-
-    return dates
-
-
-# ============================================================
-# BUILD 20-DAY AVERAGE TURNOVER
-# ============================================================
-
-def build_average_turnover(symbols):
-
-    dates = (
-        get_previous_trading_dates()
-    )
-
-    daily_data = []
-
-    with ThreadPoolExecutor(
-        max_workers=6
-    ) as executor:
-
-        futures = {
-            executor.submit(
-                get_bhavcopy,
-                d
-            ): d
-            for d in dates
-        }
-
-        for future in as_completed(
-            futures
-        ):
-
-            try:
-
-                result = future.result()
-
-                if result:
-                    daily_data.append(
-                        result
-                    )
-
-            except Exception:
-                pass
-
-    if len(daily_data) < 20:
-
-        raise RuntimeError(
-            f"Only {len(daily_data)} "
-            f"valid trading days available."
-        )
-
-    turnover_sum = {
-        s: 0.0
-        for s in symbols
-    }
-
-    turnover_count = {
-        s: 0
-        for s in symbols
-    }
-
-    for day in daily_data:
-
-        for symbol in symbols:
-
-            item = day.get(
-                symbol
-            )
-
-            if not item:
-                continue
-
-            turnover_sum[symbol] += (
-                item["turnover"]
-            )
-
-            turnover_count[symbol] += 1
-
-    average = {}
-
-    for symbol in symbols:
-
-        if (
-            turnover_count[symbol]
-            == 20
-        ):
-
-            average[symbol] = (
-                turnover_sum[symbol]
-                / 20.0
-            )
-
-    print(
-        f"20D average turnover calculated "
-        f"for {len(average)} stocks"
-    )
-
-    return average
-
-
-# ============================================================
-# EARLY STRENGTH SCORE
-# ============================================================
-
-def calculate_score(row, avg_turnover):
-
-    open_price = row["open"]
-    low_price = row["low"]
-    close_price = row["close"]
-    prev_close = row["prev_close"]
-    volume = row["volume"]
-
-    average_turnover = (
-        avg_turnover
-    )
-
-    # --------------------------------------------------------
-    # 1. OPEN-LOW GAP SCORE — 30%
-    # --------------------------------------------------------
-
-    gap = (
-        (
-            open_price
-            - low_price
-        )
-        / open_price
-    ) * 100
-
-    gap_score = clamp(
-        (
-            1
-            - gap / 0.50
-        ) * 100
-    )
-
-    # --------------------------------------------------------
-    # 2. RECOVERY SCORE — 25%
-    # --------------------------------------------------------
-
-    recovery = (
-        (
-            close_price
-            - low_price
-        )
-        / low_price
-    ) * 100
-
-    recovery_score = clamp(
-        (
-            recovery
-            / 1.50
-        ) * 100
-    )
-
-    # --------------------------------------------------------
-    # 3. GAIN SCORE — 15%
-    # --------------------------------------------------------
-
-    gain = (
-        (
-            close_price
-            - prev_close
-        )
-        / prev_close
-    ) * 100
-
-    gain_score = clamp(
-        (
-            gain
-            / 3.00
-        ) * 100
-    )
-
-    # --------------------------------------------------------
-    # 4. LIVE TURNOVER SCORE — 20%
-    # --------------------------------------------------------
-
-    live_turnover = (
-        volume
-        * close_price
-    )
-
-    if average_turnover > 0:
-
-        live_turnover_score = clamp(
-            (
-                live_turnover
-                / (
-                    average_turnover
-                    * 2.5
-                )
-            ) * 100
-        )
-
-    else:
-
-        live_turnover_score = 0.0
-
-    # --------------------------------------------------------
-    # 5. AVERAGE TURNOVER SCORE — 10%
-    # --------------------------------------------------------
-
-    average_turnover_score = clamp(
-        (
-            average_turnover
-            / 100000000
-        ) * 100
-    )
-
-    # --------------------------------------------------------
-    # FINAL EARLY STRENGTH SCORE
-    # --------------------------------------------------------
-
-    final_score = (
-
-        gap_score * 0.30
-
-        + recovery_score * 0.25
-
-        + gain_score * 0.15
-
-        + live_turnover_score * 0.20
-
-        + average_turnover_score * 0.10
-    )
-
-    return {
-
-        "gap":
-            gap,
-
-        "gap_score":
-            gap_score,
-
-        "recovery":
-            recovery,
-
-        "recovery_score":
-            recovery_score,
-
-        "gain":
-            gain,
-
-        "gain_score":
-            gain_score,
-
-        "live_turnover":
-            live_turnover,
-
-        "live_turnover_score":
-            live_turnover_score,
-
-        "avg_turnover":
-            average_turnover,
-
-        "avg_turnover_score":
-            average_turnover_score,
-
-        "score":
-            clamp(final_score)
-    }
-
-
-# ============================================================
-# MAIN SCAN
-# ============================================================
-
-def perform_scan():
-
-    global LAST_SCAN_TIME
-    global LAST_ERROR
-
-    LAST_ERROR = ""
-
-    if not TOKEN:
-
-        raise RuntimeError(
-            "UPSTOX_ACCESS_TOKEN "
-            "Render Environment Variables "
-            "में नहीं मिला।"
-        )
-
-    print(
-        "Starting Early Strength Rank scan..."
-    )
-
-    live_quotes = (
-        fetch_all_live_quotes()
-    )
-
-    if not live_quotes:
-
-        raise RuntimeError(
-            "Upstox से live quotes नहीं मिले।"
-        )
-
-    symbols = {
-        x["symbol"]
-        for x in live_quotes
-    }
-
-    print(
-        f"Eligible price universe: "
-        f"{len(live_quotes)} stocks"
-    )
-
-    average_turnovers = (
-        build_average_turnover(
-            symbols
-        )
-    )
-
+def fetch_live_quotes():
     results = []
 
-    for row in live_quotes:
+    keys = [x["instrument_key"] for x in INSTRUMENTS]
 
-        symbol = row["symbol"]
+    for i in range(0, len(keys), 500):
+        batch = keys[i:i + 500]
 
-        # ----------------------------------------------------
-        # ONLY selection condition:
-        # PRICE >= ₹50
-        # ----------------------------------------------------
+        try:
+            params = {
+                "instrument_key": ",".join(batch)
+            }
 
-        if row["close"] < MIN_PRICE:
-            continue
+            url = BASE + "/v3/market-quote/quotes"
 
-        if symbol not in average_turnovers:
-            continue
+            r = requests.get(
+                url,
+                headers=headers(),
+                params=params,
+                timeout=20
+            )
 
-        scores = calculate_score(
-            row,
-            average_turnovers[symbol]
-        )
+            r.raise_for_status()
 
-        results.append({
+            data = r.json().get("data", {})
 
-            "symbol":
-                symbol,
+            for response_key, q in data.items():
 
-            "name":
-                row["name"],
+                instrument_key = q.get("instrument_token")
 
-            "score":
-                scores["score"],
+                if not instrument_key:
+                    meta = BY_KEY.get(
+                        response_key.replace(":", "|"),
+                        {}
+                    )
+                    instrument_key = meta.get("instrument_key")
 
-            "price":
-                row["close"],
+                if not instrument_key:
+                    continue
 
-            "open":
-                row["open"],
+                q["_instrument_key"] = instrument_key
+                results.append(q)
 
-            "low":
-                row["low"],
+        except Exception as e:
+            log(f"Quote batch error: {repr(e)}")
 
-            "prev_close":
-                row["prev_close"],
+        time.sleep(0.15)
 
-            "gap":
-                scores["gap"],
-
-            "recovery":
-                scores["recovery"],
-
-            "gain":
-                scores["gain"],
-
-            "live_turnover":
-                scores["live_turnover"],
-
-            "avg_turnover":
-                scores["avg_turnover"],
-
-            "gap_score":
-                scores["gap_score"],
-
-            "recovery_score":
-                scores["recovery_score"],
-
-            "gain_score":
-                scores["gain_score"],
-
-            "live_turnover_score":
-                scores[
-                    "live_turnover_score"
-                ],
-
-            "avg_turnover_score":
-                scores[
-                    "avg_turnover_score"
-                ]
-        })
-
-    results.sort(
-        key=lambda x: x["score"],
-        reverse=True
-    )
-
-    for i, row in enumerate(
-        results,
-        start=1
-    ):
-
-        row["rank"] = i
-
-    LAST_SCAN_TIME = (
-        datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-    )
-
-    print(
-        f"FINAL RESULTS: {len(results)}"
-    )
+    log(f"Live quotes received: {len(results)}")
 
     return results
 
 
 # ============================================================
-# BACKGROUND SCAN
+# HISTORICAL 20-DAY TURNOVER
 # ============================================================
 
-def scan_worker():
+def historical_20day_turnover(key, today):
+    """
+    Gets up to 50 calendar days of daily candles and
+    calculates the average of the latest 20 valid trading days.
 
-    global SCAN_RUNNING
+    Turnover = Close × Volume
+    """
+
+    yesterday = today - timedelta(days=1)
+    start = today - timedelta(days=MAX_HIST_DAYS)
+
+    url = (
+        BASE
+        + "/v3/historical-candle/"
+        + quote(key, safe="|")
+        + "/days/1/"
+        + yesterday.isoformat()
+        + "/"
+        + start.isoformat()
+    )
+
+    try:
+        r = requests.get(
+            url,
+            headers=headers(),
+            timeout=15
+        )
+
+        r.raise_for_status()
+
+        candles = r.json().get("data", {}).get("candles", [])
+
+        valid = []
+
+        for c in candles:
+
+            if len(c) < 6:
+                continue
+
+            try:
+                close = safe_float(c[4])
+                volume = safe_float(c[5])
+
+                if close > 0 and volume > 0:
+                    turnover = close * volume
+                    valid.append(turnover)
+
+            except Exception:
+                continue
+
+        if len(valid) < LIQUIDITY_DAYS:
+            return None
+
+        # Historical response is normally newest first,
+        # but sorting is safer.
+        valid = valid[:LIQUIDITY_DAYS]
+
+        return sum(valid) / len(valid)
+
+    except Exception as e:
+        log(f"Historical error {key}: {repr(e)}")
+        return None
+
+
+# ============================================================
+# CACHE 20-DAY TURNOVER
+# ============================================================
+
+def get_average_turnovers():
+
+    global HIST_CACHE, CACHE_DATE
+
+    today = ist_now().date()
+    today_key = today.isoformat()
+
+    # New day = fresh cache
+    if CACHE_DATE != today_key:
+        HIST_CACHE = {}
+        CACHE_DATE = today_key
+
+    result = {}
+
+    pending = []
+
+    for item in INSTRUMENTS:
+
+        key = item["instrument_key"]
+
+        if key in HIST_CACHE:
+            result[key] = HIST_CACHE[key]
+        else:
+            pending.append(key)
+
+    log(
+        f"20D turnover cache: {len(result)} ready, "
+        f"{len(pending)} pending"
+    )
+
+    if not pending:
+        return result
+
+    # Upstox standard rate limit is large enough for this
+    # controlled parallel approach.
+    #
+    # We deliberately keep workers limited so the API
+    # is not flooded.
+
+    completed = 0
+
+    def worker(key):
+        return key, historical_20day_turnover(key, today)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+
+        futures = {
+            executor.submit(worker, key): key
+            for key in pending
+        }
+
+        for future in as_completed(futures):
+
+            key = futures[future]
+
+            try:
+                k, value = future.result()
+
+                if value is not None:
+                    HIST_CACHE[k] = value
+                    result[k] = value
+
+            except Exception as e:
+                log(f"Turnover worker error: {repr(e)}")
+
+            completed += 1
+
+            if completed % 50 == 0:
+                log(
+                    f"20D turnover progress: "
+                    f"{completed}/{len(pending)}"
+                )
+
+    log(
+        f"20D turnover completed: "
+        f"{len(result)} stocks"
+    )
+
+    return result
+
+
+# ============================================================
+# LIVE CANDIDATES
+# ============================================================
+
+def build_candidates(quotes):
+
+    output = []
+
+    rejected_price = 0
+    rejected_data = 0
+
+    for q in quotes:
+
+        try:
+
+            key = q.get("_instrument_key")
+
+            meta = BY_KEY.get(key, {})
+
+            symbol = (
+                meta.get("trading_symbol")
+                or q.get("symbol")
+                or ""
+            )
+
+            price = safe_float(q.get("last_price"))
+
+            prev_close = safe_float(
+                q.get("prev_close_price")
+            )
+
+            ohlc = q.get("ohlc") or {}
+
+            opening_price = safe_float(
+                ohlc.get("open")
+            )
+
+            low_price = safe_float(
+                ohlc.get("low")
+            )
+
+            volume = safe_float(
+                q.get("volume")
+                or ohlc.get("volume")
+            )
+
+            average_price = safe_float(
+                q.get("average_price")
+            )
+
+            # Only Price >= ₹50
+            if price < MIN_PRICE:
+                rejected_price += 1
+                continue
+
+            if opening_price <= 0 or low_price <= 0:
+                rejected_data += 1
+                continue
+
+            # ------------------------------------------------
+            # EXACT CHARTINK-STYLE COMPONENTS
+            # ------------------------------------------------
+
+            gap = (
+                (opening_price - low_price)
+                / opening_price
+            ) * 100.0
+
+            recovery = (
+                (price - low_price)
+                / low_price
+            ) * 100.0
+
+            gain = 0.0
+
+            if prev_close > 0:
+                gain = (
+                    (price - prev_close)
+                    / prev_close
+                ) * 100.0
+
+            live_price = (
+                average_price
+                if average_price > 0
+                else price
+            )
+
+            live_turnover = volume * live_price
+
+            output.append({
+                "key": key,
+                "symbol": symbol,
+                "price": price,
+                "open": opening_price,
+                "low": low_price,
+                "gap": gap,
+                "recovery": recovery,
+                "gain": gain,
+                "volume": volume,
+                "live_turnover": live_turnover
+            })
+
+        except Exception:
+            continue
+
+    log(
+        f"Candidates: {len(output)} | "
+        f"Price rejected: {rejected_price} | "
+        f"Missing OHLC: {rejected_data}"
+    )
+
+    return output
+
+
+# ============================================================
+# APPLY EARLY STRENGTH SCORE
+# ============================================================
+
+def apply_strength_score(items, avg_turnovers):
+
+    final = []
+
+    for x in items:
+
+        key = x["key"]
+
+        avg_turnover = avg_turnovers.get(key)
+
+        if avg_turnover is None:
+            continue
+
+        # ₹10 Crore average turnover filter
+        if avg_turnover < MIN_AVG_TURNOVER:
+            continue
+
+        # ----------------------------------------------------
+        # 1. OPEN-LOW GAP SCORE
+        # Maximum reference gap = 0.50%
+        # ----------------------------------------------------
+
+        gap_score = max(
+            0.0,
+            min(
+                100.0,
+                (1.0 - x["gap"] / 0.50) * 100.0
+            )
+        )
+
+        # ----------------------------------------------------
+        # 2. RECOVERY SCORE
+        # 1.50% recovery = 100
+        # ----------------------------------------------------
+
+        recovery_score = max(
+            0.0,
+            min(
+                100.0,
+                (x["recovery"] / 1.50) * 100.0
+            )
+        )
+
+        # ----------------------------------------------------
+        # 3. GAIN SCORE
+        # 3.00% gain = 100
+        # ----------------------------------------------------
+
+        gain_score = max(
+            0.0,
+            min(
+                100.0,
+                (x["gain"] / 3.00) * 100.0
+            )
+        )
+
+        # ----------------------------------------------------
+        # 4. LIVE TURNOVER SCORE
+        # 2.5 × average turnover = 100
+        # ----------------------------------------------------
+
+        live_score = 0.0
+
+        if avg_turnover > 0:
+
+            live_score = max(
+                0.0,
+                min(
+                    100.0,
+                    (
+                        x["live_turnover"]
+                        / (avg_turnover * 2.5)
+                    ) * 100.0
+                )
+            )
+
+        # ----------------------------------------------------
+        # 5. AVERAGE TURNOVER SCORE
+        # ₹10 Crore = 10
+        # ₹100 Crore = 100
+        # ----------------------------------------------------
+
+        avg_score = max(
+            0.0,
+            min(
+                100.0,
+                (avg_turnover / 100_000_000.0) * 100.0
+            )
+        )
+
+        # ----------------------------------------------------
+        # FINAL WEIGHTING
+        #
+        # Gap       5%
+        # Recovery 20%
+        # Gain      35%
+        # Live      30%
+        # Average   10%
+        # ----------------------------------------------------
+
+        strength = (
+            gap_score * WEIGHT_GAP
+            + recovery_score * WEIGHT_RECOVERY
+            + gain_score * WEIGHT_GAIN
+            + live_score * WEIGHT_LIVE
+            + avg_score * WEIGHT_AVG
+        )
+
+        x["gap_score"] = gap_score
+        x["recovery_score"] = recovery_score
+        x["gain_score"] = gain_score
+        x["live_score"] = live_score
+        x["avg_score"] = avg_score
+        x["avg_turnover"] = avg_turnover
+        x["strength"] = strength
+
+        final.append(x)
+
+    # Strongest first
+    final.sort(
+        key=lambda x: (
+            -x["strength"],
+            -x["gain"],
+            -x["live_turnover"],
+            -x["recovery"]
+        )
+    )
+
+    return final
+
+
+# ============================================================
+# SCAN
+# ============================================================
+
+def perform_scan():
+
     global LIVE_RESULTS
-    global LAST_ERROR
+    global LAST_SCAN_TIME
+    global LAST_SCAN_ERROR
+    global SCAN_RUNNING
+
+    with SCAN_LOCK:
+
+        if SCAN_RUNNING:
+            return
+
+        SCAN_RUNNING = True
 
     try:
 
-        LIVE_RESULTS = perform_scan()
+        LAST_SCAN_ERROR = ""
+        LIVE_RESULTS = []
+
+        log("==========================================")
+        log("EARLY STRENGTH SCAN STARTED")
+        log("==========================================")
+
+        if not UPSTOX_TOKEN:
+            raise RuntimeError(
+                "UPSTOX_ACCESS_TOKEN Render Environment "
+                "Variables में नहीं मिला।"
+            )
+
+        load_instruments()
+
+        # ----------------------------------------------------
+        # LIVE DATA
+        # ----------------------------------------------------
+
+        quotes = fetch_live_quotes()
+
+        candidates = build_candidates(quotes)
+
+        if not candidates:
+            LIVE_RESULTS = []
+            LAST_SCAN_TIME = ist_now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            return
+
+        # ----------------------------------------------------
+        # 20 DAY TURNOVER
+        # ----------------------------------------------------
+
+        avg_turnovers = get_average_turnovers()
+
+        log(
+            f"Average turnover data available: "
+            f"{len(avg_turnovers)}"
+        )
+
+        # ----------------------------------------------------
+        # FINAL SCORE
+        # ----------------------------------------------------
+
+        ranked = apply_strength_score(
+            candidates,
+            avg_turnovers
+        )
+
+        LIVE_RESULTS = []
+
+        for item in ranked:
+
+            LIVE_RESULTS.append({
+                "symbol": item["symbol"],
+                "price": round(item["price"], 2),
+                "open": round(item["open"], 2),
+                "low": round(item["low"], 2),
+                "gap": round(item["gap"], 3),
+                "recovery": round(item["recovery"], 2),
+                "gain": round(item["gain"], 2),
+                "strength": round(item["strength"], 1),
+                "avg_turnover_cr": round(
+                    item["avg_turnover"] / 10_000_000.0,
+                    2
+                ),
+                "live_turnover_cr": round(
+                    item["live_turnover"] / 10_000_000.0,
+                    2
+                ),
+                "volume": int(item["volume"])
+            })
+
+        LAST_SCAN_TIME = ist_now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        log(
+            f"FINAL RESULTS: {len(LIVE_RESULTS)}"
+        )
+
+        if LIVE_RESULTS:
+            log(
+                "TOP SHARE: "
+                + LIVE_RESULTS[0]["symbol"]
+                + " | Strength "
+                + str(LIVE_RESULTS[0]["strength"])
+            )
 
     except Exception as e:
 
-        LAST_ERROR = repr(e)
+        LAST_SCAN_ERROR = str(e)
 
-        print(
-            "SCAN ERROR:",
-            repr(e)
+        log(
+            "SCAN ERROR: "
+            + repr(e)
         )
 
     finally:
@@ -1020,47 +714,32 @@ def scan_worker():
         SCAN_RUNNING = False
 
 
-def start_scan():
-
-    global SCAN_RUNNING
-
-    with SCAN_LOCK:
-
-        if SCAN_RUNNING:
-            return False
-
-        SCAN_RUNNING = True
-
-    threading.Thread(
-        target=scan_worker,
-        daemon=True
-    ).start()
-
-    return True
-
-
 # ============================================================
 # HTML
 # ============================================================
 
-HTML = """
+HTML = r"""
 <!DOCTYPE html>
-<html>
+<html lang="hi">
 <head>
-
+<meta charset="UTF-8">
 <meta name="viewport"
-      content="width=device-width, initial-scale=1">
+content="width=device-width, initial-scale=1.0">
 
 <title>Early Strength Rank Scanner</title>
 
 <style>
 
+*{
+    box-sizing:border-box;
+}
+
 body{
     margin:0;
     padding:10px;
-    background:#11151a;
+    background:#10151b;
     color:#e8edf3;
-    font-family:Arial,sans-serif;
+    font-family:Arial,Helvetica,sans-serif;
 }
 
 .container{
@@ -1068,38 +747,74 @@ body{
     margin:auto;
 }
 
-h1{
-    font-size:22px;
-    margin:5px 0;
-}
-
-.subtitle{
-    color:#9fa8b3;
-    font-size:13px;
-    margin-bottom:12px;
-}
-
 .card{
-    background:#1a2027;
-    border:1px solid #303944;
+    background:#171d24;
+    border:1px solid #2a333d;
     border-radius:12px;
-    padding:12px;
+    padding:14px;
     margin-bottom:12px;
 }
 
-button{
-    background:#2864e8;
-    color:white;
-    border:0;
-    padding:12px 20px;
-    border-radius:8px;
-    font-size:16px;
+h1{
+    margin:0;
+    font-size:24px;
+}
+
+.sub{
+    margin-top:5px;
+    color:#9da8b5;
 }
 
 .status{
+    padding:10px;
+    border-radius:8px;
+    background:#202832;
+    margin-bottom:10px;
+}
+
+button{
+    border:0;
+    border-radius:8px;
+    padding:11px 18px;
+    background:#2f80ed;
+    color:white;
+    font-size:15px;
+}
+
+button:disabled{
+    opacity:.5;
+}
+
+.info{
+    color:#aeb8c5;
+    margin-bottom:10px;
+}
+
+.error{
+    color:#ff8f9a;
     margin-top:10px;
-    color:#b9c2cc;
-    font-size:14px;
+}
+
+.filters{
+    display:grid;
+    grid-template-columns:repeat(5,1fr);
+    gap:8px;
+}
+
+.filter{
+    background:#1d252e;
+    border-radius:8px;
+    padding:10px;
+}
+
+.ft{
+    color:#8f9baa;
+    font-size:12px;
+}
+
+.fv{
+    margin-top:4px;
+    font-weight:bold;
 }
 
 .table-wrap{
@@ -1109,45 +824,67 @@ button{
 table{
     width:100%;
     border-collapse:collapse;
-    min-width:1000px;
-    background:#171c22;
-    font-size:13px;
+    min-width:850px;
 }
 
-th{
-    background:#252c35;
-    padding:9px 6px;
-    white-space:nowrap;
-}
-
-td{
-    padding:8px 6px;
-    border-bottom:1px solid #2c333c;
+th,td{
+    border-bottom:1px solid #29323c;
+    padding:9px 7px;
     text-align:center;
     white-space:nowrap;
 }
 
-.rank{
+th{
+    color:#9da8b5;
+    font-size:12px;
+}
+
+td{
+    font-size:13px;
+}
+
+.symbol{
+    text-align:left;
     font-weight:bold;
 }
 
-.score{
+.strength{
     font-weight:bold;
     font-size:15px;
 }
 
 .top{
-    background:#1457b8;
+    background:#202a23;
 }
 
-.note{
-    color:#8e98a4;
-    font-size:12px;
-    line-height:1.5;
+.empty{
+    padding:25px;
+    color:#8f9baa;
+}
+
+.logic{
+    color:#aeb8c5;
+    line-height:1.7;
+    font-size:13px;
+}
+
+@media(max-width:700px){
+
+    body{
+        padding:7px;
+    }
+
+    h1{
+        font-size:21px;
+    }
+
+    .filters{
+        grid-template-columns:1fr 1fr;
+    }
+
 }
 
 </style>
-
 </head>
 
 <body>
@@ -1158,30 +895,70 @@ td{
 
 <h1>Early Strength Rank Scanner</h1>
 
-<div class="subtitle">
-Upstox NSE EQ • Early Strength Score • Strongest First
-</div>
-
-<div>
-<b>Price:</b> ₹50 or above<br>
-<b>Universe:</b> Upstox NSE EQ<br>
-<b>Scoring:</b> Chartink Early Strength formula
-</div>
-
-<br>
-
-<button onclick="runScan()">
-SCAN NOW
-</button>
-
-<div id="status"
-     class="status">
-Ready
+<div class="sub">
+NSE EQ • Live Strength Ranking • Strongest First
 </div>
 
 </div>
+
 
 <div class="card">
+
+<div class="status" id="status">
+Scanner तैयार है
+</div>
+
+<div class="info" id="info">
+Scan शुरू करने के लिए नीचे button दबाएँ।
+</div>
+
+<button id="scanButton"
+onclick="startScan()">
+Scan Now
+</button>
+
+<div class="error"
+id="error">
+</div>
+
+</div>
+
+
+<div class="filters">
+
+<div class="filter">
+<div class="ft">Price</div>
+<div class="fv">≥ ₹50</div>
+</div>
+
+<div class="filter">
+<div class="ft">Gap Weight</div>
+<div class="fv">5%</div>
+</div>
+
+<div class="filter">
+<div class="ft">Recovery</div>
+<div class="fv">20%</div>
+</div>
+
+<div class="filter">
+<div class="ft">Gain</div>
+<div class="fv">35%</div>
+</div>
+
+<div class="filter">
+<div class="ft">Live Turnover</div>
+<div class="fv">30%</div>
+</div>
+
+</div>
+
+
+<div class="card">
+
+<h2 id="resultsTitle">
+Results: 0
+</h2>
 
 <div class="table-wrap">
 
@@ -1190,24 +967,29 @@ Ready
 <thead>
 
 <tr>
-
 <th>Rank</th>
-<th>Symbol</th>
+<th>Share</th>
 <th>Strength</th>
-<th>Price</th>
+<th>LTP</th>
 <th>Open</th>
 <th>Low</th>
 <th>Gap</th>
 <th>Recovery</th>
 <th>Gain</th>
+<th>Avg 20D Turnover</th>
 <th>Live Turnover</th>
-<th>20D Avg Turnover</th>
-
 </tr>
 
 </thead>
 
-<tbody id="rows">
+<tbody id="resultsBody">
+
+<tr>
+<td colspan="11"
+class="empty">
+अभी scan शुरू नहीं हुआ है।
+</td>
+</tr>
 
 </tbody>
 
@@ -1217,189 +999,201 @@ Ready
 
 </div>
 
-<div class="card note">
 
-<b>Formula:</b><br>
+<div class="card logic">
 
-Open-Low Gap Score = 30%<br>
-Recovery Score = 25%<br>
-Gain Score = 15%<br>
-Live Turnover Score = 20%<br>
-Average Turnover Score = 10%<br><br>
+<h3>Ranking Logic</h3>
 
-Gain और Recovery केवल scoring में इस्तेमाल होते हैं।
-इन दोनों पर कोई filter नहीं लगाया गया है।
+<div>• NSE Equity shares only</div>
 
-<br><br>
+<div>• Price ≥ ₹50</div>
 
-केवल Price ≥ ₹50 का selection condition है।
+<div>• Open-Low Gap Score = 5%</div>
+
+<div>• Recovery Score = 20%</div>
+
+<div>• Gain Score = 35%</div>
+
+<div>• Live Turnover Score = 30%</div>
+
+<div>• Average Turnover Score = 10%</div>
+
+<div>• Previous 20 valid trading days average turnover ≥ ₹10 Crore</div>
+
+<div>• Gain और Recovery केवल scoring में इस्तेमाल होते हैं; इन पर अलग filter नहीं है।</div>
+
+<div>• सबसे मजबूत qualifying share Rank 1 पर आएगा।</div>
 
 </div>
 
 </div>
+
 
 <script>
 
-async function runScan(){
+let timer=null;
 
-    const status =
-        document.getElementById("status");
+async function startScan(){
 
-    status.innerText =
-        "Scanner चल रहा है...";
+    const btn=document.getElementById("scanButton");
+
+    btn.disabled=true;
+
+    document.getElementById("status").innerText=
+        "Scan चल रहा है...";
+
+    document.getElementById("info").innerText=
+        "Live quotes और 20-day turnover data लिया जा रहा है।";
+
+    document.getElementById("error").innerText="";
 
     try{
 
-        await fetch("/api/start");
+        await fetch("/api/scan",{
+            method:"POST"
+        });
 
-        poll();
+        if(timer){
+            clearInterval(timer);
+        }
+
+        timer=setInterval(loadResults,2000);
+
+        loadResults();
 
     }catch(e){
 
-        status.innerText =
-            "Scanner start error";
+        btn.disabled=false;
+
+        document.getElementById("error").innerText=
+            "Scan start नहीं हो पाया।";
 
     }
+
 }
 
 
-async function poll(){
+async function loadResults(){
 
     try{
 
-        const r =
-            await fetch("/api/results");
+        const r=await fetch(
+            "/api/results",
+            {cache:"no-store"}
+        );
 
-        const data =
-            await r.json();
+        const d=await r.json();
 
-        const status =
-            document.getElementById(
-                "status"
-            );
+        const btn=document.getElementById("scanButton");
 
-        if(data.running){
+        if(d.running){
 
-            status.innerText =
-                "Live data और 20-day turnover calculation चल रही है...";
+            btn.disabled=true;
 
-            setTimeout(
-                poll,
-                500
-            );
+            document.getElementById("status").innerText=
+                "Scan चल रहा है...";
 
-            return;
-        }
+        }else{
 
-        if(data.error){
+            btn.disabled=false;
 
-            status.innerText =
-                "Error: " + data.error;
+            document.getElementById("status").innerText=
+                "Scan complete";
 
-            return;
-        }
+            if(timer){
 
-        status.innerText =
-            "Scan complete • " +
-            data.results.length +
-            " stocks found • " +
-            data.updated_at;
-
-        const tbody =
-            document.getElementById(
-                "rows"
-            );
-
-        tbody.innerHTML = "";
-
-        data.results.forEach(
-            function(x){
-
-                const tr =
-                    document.createElement(
-                        "tr"
-                    );
-
-                if(x.rank <= 5){
-                    tr.className = "top";
-                }
-
-                tr.innerHTML =
-
-                    "<td class='rank'>" +
-                    x.rank +
-                    "</td>" +
-
-                    "<td><b>" +
-                    x.symbol +
-                    "</b></td>" +
-
-                    "<td class='score'>" +
-                    x.score.toFixed(1) +
-                    "</td>" +
-
-                    "<td>₹" +
-                    x.price.toFixed(2) +
-                    "</td>" +
-
-                    "<td>₹" +
-                    x.open.toFixed(2) +
-                    "</td>" +
-
-                    "<td>₹" +
-                    x.low.toFixed(2) +
-                    "</td>" +
-
-                    "<td>" +
-                    x.gap.toFixed(2) +
-                    "%</td>" +
-
-                    "<td>" +
-                    x.recovery.toFixed(2) +
-                    "%</td>" +
-
-                    "<td>" +
-                    x.gain.toFixed(2) +
-                    "%</td>" +
-
-                    "<td>" +
-                    formatCr(
-                        x.live_turnover
-                    ) +
-                    "</td>" +
-
-                    "<td>" +
-                    formatCr(
-                        x.avg_turnover
-                    ) +
-                    "</td>";
-
-                tbody.appendChild(tr);
+                clearInterval(timer);
+                timer=null;
 
             }
-        );
+
+        }
+
+        document.getElementById("info").innerText=
+            "Last Scan: "+d.last_scan;
+
+        document.getElementById("error").innerText=
+            d.error || "";
+
+        const rows=d.results || [];
+
+        document.getElementById("resultsTitle").innerText=
+            "Results: "+rows.length;
+
+        const body=document.getElementById("resultsBody");
+
+        if(!rows.length){
+
+            body.innerHTML=
+                '<tr><td colspan="11" class="empty">'+
+                (d.error ||
+                "कोई qualifying share नहीं मिला।")+
+                '</td></tr>';
+
+            return;
+
+        }
+
+        body.innerHTML=rows.map((x,i)=>`
+
+            <tr class="${i===0?'top':''}">
+
+                <td>${i+1}</td>
+
+                <td class="symbol">
+                    ${x.symbol}
+                </td>
+
+                <td class="strength">
+                    ${Number(x.strength).toFixed(1)}
+                </td>
+
+                <td>
+                    ₹${Number(x.price).toFixed(2)}
+                </td>
+
+                <td>
+                    ₹${Number(x.open).toFixed(2)}
+                </td>
+
+                <td>
+                    ₹${Number(x.low).toFixed(2)}
+                </td>
+
+                <td>
+                    ${Number(x.gap).toFixed(3)}%
+                </td>
+
+                <td>
+                    ${Number(x.recovery).toFixed(2)}%
+                </td>
+
+                <td>
+                    ${Number(x.gain).toFixed(2)}%
+                </td>
+
+                <td>
+                    ₹${Number(x.avg_turnover_cr).toFixed(2)} Cr
+                </td>
+
+                <td>
+                    ₹${Number(x.live_turnover_cr).toFixed(2)} Cr
+                </td>
+
+            </tr>
+
+        `).join("");
 
     }catch(e){
 
-        setTimeout(
-            poll,
-            2000
-        );
+        document.getElementById("error").innerText=
+            "Server response नहीं मिला। Render Logs देखें।";
 
     }
 
 }
 
-
-function formatCr(value){
-
-    return (
-        (value / 10000000)
-        .toFixed(2)
-        + " Cr"
-    );
-
-}
+loadResults();
 
 </script>
 
@@ -1414,20 +1208,30 @@ function formatCr(value){
 
 @app.route("/")
 def home():
+    return render_template_string(HTML)
 
-    return HTML
 
+@app.route("/api/scan", methods=["POST"])
+def api_scan():
 
-@app.route("/api/start")
-def api_start():
+    global SCAN_RUNNING
 
-    started = start_scan()
+    if SCAN_RUNNING:
+        return jsonify({
+            "ok": True,
+            "message": "Scan already running"
+        })
+
+    thread = threading.Thread(
+        target=perform_scan,
+        daemon=True
+    )
+
+    thread.start()
 
     return jsonify({
-        "started":
-            started,
-        "running":
-            SCAN_RUNNING
+        "ok": True,
+        "message": "Scan started"
     })
 
 
@@ -1435,43 +1239,10 @@ def api_start():
 def api_results():
 
     return jsonify({
-
-        "running":
-            SCAN_RUNNING,
-
-        "error":
-            LAST_ERROR,
-
-        "updated_at":
-            LAST_SCAN_TIME,
-
-        "results":
-            LIVE_RESULTS
-    })
-
-
-@app.route("/api/health")
-def health():
-
-    return jsonify({
-
-        "ok":
-            True,
-
-        "token_configured":
-            bool(TOKEN),
-
-        "nse_eq_stocks":
-            len(INSTRUMENTS),
-
-        "scan_running":
-            SCAN_RUNNING,
-
-        "last_scan":
-            LAST_SCAN_TIME,
-
-        "last_error":
-            LAST_ERROR
+        "running": SCAN_RUNNING,
+        "last_scan": LAST_SCAN_TIME,
+        "error": LAST_SCAN_ERROR,
+        "results": LIVE_RESULTS
     })
 
 
@@ -1481,8 +1252,10 @@ def health():
 
 if __name__ == "__main__":
 
+    port = int(os.environ.get("PORT", "10000"))
+
     app.run(
         host="0.0.0.0",
-        port=5000,
+        port=port,
         debug=False
     )
