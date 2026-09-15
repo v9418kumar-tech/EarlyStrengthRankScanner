@@ -1,15 +1,13 @@
 from flask import Flask, jsonify, render_template_string
 import requests
 import os
-import io
-import csv
 import json
 import gzip
-import zipfile
 import threading
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
 app = Flask(__name__)
 
@@ -17,73 +15,61 @@ app = Flask(__name__)
 # SETTINGS
 # =========================================================
 
-UPSTOX_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
+UPSTOX_TOKEN = os.getenv(
+    "UPSTOX_ACCESS_TOKEN", ""
+).strip()
 
-UPSTOX_BASE = "https://api.upstox.com"
+BASE_URL = "https://api.upstox.com"
 
 INSTRUMENT_URL = (
-    "https://assets.upstox.com/market-quote/"
-    "instruments/exchange/complete.json.gz"
-)
-
-NSE_HOME = "https://www.nseindia.com"
-
-NSE_ARCHIVE_BASE = "https://nsearchives.nseindia.com"
-
-NSE_UDIFF_URL = (
-    NSE_ARCHIVE_BASE +
-    "/content/cm/"
-    "BhavCopy_NSE_CM_0_0_0_{ymd}_F_0000.csv.zip"
-)
-
-NSE_REPORTS_URL = (
-    NSE_HOME + "/api/reports"
+    "https://assets.upstox.com/"
+    "market-quote/instruments/"
+    "exchange/complete.json.gz"
 )
 
 MIN_PRICE = 50.0
-MIN_AVG_TURNOVER = 100000000.0
+
 LIQUIDITY_DAYS = 20
 
 # FINAL WEIGHTS
-W_GAP = 0.05
-W_RECOVERY = 0.20
-W_GAIN = 0.35
-W_LIVE = 0.30
-W_AVG = 0.10
+GAP_WEIGHT = 0.05
+RECOVERY_WEIGHT = 0.20
+GAIN_WEIGHT = 0.35
+LIVE_TURNOVER_WEIGHT = 0.30
+AVERAGE_TURNOVER_WEIGHT = 0.10
 
 IST = ZoneInfo("Asia/Kolkata")
 
-UPSTOX_HEADERS = {
-    "Content-Type": "application/json",
+HEADERS = {
     "Accept": "application/json",
-    "Authorization": f"Bearer {UPSTOX_TOKEN}"
+    "Authorization":
+        f"Bearer {UPSTOX_TOKEN}"
 }
 
-NSE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/138.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,"
-        "application/xml;q=0.9,image/webp,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/",
-    "Connection": "keep-alive"
-}
+# Keep requests comfortably below
+# Upstox standard API rate limits.
+HISTORY_DELAY = 0.20
+
+# Retry settings for temporary API problems.
+MAX_RETRIES = 4
+
+# =========================================================
+# STATE
+# =========================================================
 
 STATE = {
     "running": False,
     "status": "Ready",
     "last_scan": None,
     "results": [],
-    "error": None
+    "error": None,
+    "progress": 0,
+    "total": 0
 }
 
 LOCK = threading.Lock()
 
+# Same-day average turnover cache.
 TURNOVER_CACHE = {
     "date": None,
     "data": {}
@@ -91,7 +77,7 @@ TURNOVER_CACHE = {
 
 
 # =========================================================
-# BASIC HELPERS
+# BASIC
 # =========================================================
 
 def now_ist():
@@ -103,15 +89,21 @@ def set_status(text):
         STATE["status"] = text
 
 
-def clamp(x, lo=0.0, hi=100.0):
-    return max(lo, min(hi, x))
+def set_progress(done, total):
+    with LOCK:
+        STATE["progress"] = done
+        STATE["total"] = total
+
+
+def clamp(value, low=0.0, high=100.0):
+    return max(low, min(high, value))
 
 
 # =========================================================
-# SCORING
+# SCORE FUNCTIONS
 # =========================================================
 
-def score_gap(open_price, low_price):
+def gap_score(open_price, low_price):
 
     if open_price <= 0:
         return 0.0
@@ -126,13 +118,16 @@ def score_gap(open_price, low_price):
     )
 
 
-def score_recovery(close_price, low_price):
+def recovery_score(
+    current_price,
+    low_price
+):
 
     if low_price <= 0:
         return 0.0
 
     recovery = (
-        (close_price - low_price)
+        (current_price - low_price)
         / low_price
     ) * 100.0
 
@@ -141,14 +136,17 @@ def score_recovery(close_price, low_price):
     )
 
 
-def score_gain(close_price, prev_close):
+def gain_score(
+    current_price,
+    previous_close
+):
 
-    if prev_close <= 0:
+    if previous_close <= 0:
         return 0.0
 
     gain = (
-        (close_price - prev_close)
-        / prev_close
+        (current_price - previous_close)
+        / previous_close
     ) * 100.0
 
     return clamp(
@@ -156,7 +154,7 @@ def score_gain(close_price, prev_close):
     )
 
 
-def score_live_turnover(
+def live_turnover_score(
     live_turnover,
     average_turnover
 ):
@@ -165,712 +163,79 @@ def score_live_turnover(
         return 0.0
 
     return clamp(
-        live_turnover
-        / (average_turnover * 2.5)
-        * 100.0
+        (
+            live_turnover
+            / (average_turnover * 2.5)
+        ) * 100.0
     )
 
 
-def score_avg_turnover(
+def average_turnover_score(
     average_turnover
 ):
 
     return clamp(
-        average_turnover
-        / 100000000.0
-        * 100.0
+        (
+            average_turnover
+            / 100000000.0
+        ) * 100.0
     )
-
-
-# =========================================================
-# NSE SESSION
-# =========================================================
-
-def create_nse_session():
-
-    s = requests.Session()
-
-    s.headers.update(NSE_HEADERS)
-
-    try:
-
-        r = s.get(
-            NSE_HOME,
-            timeout=25
-        )
-
-        if r.status_code not in (200, 403):
-
-            raise RuntimeError(
-                f"NSE home status {r.status_code}"
-            )
-
-    except Exception as e:
-
-        raise RuntimeError(
-            f"NSE connection failed: {e}"
-        )
-
-    return s
-
-
-# =========================================================
-# DOWNLOAD UDIFF ARCHIVE
-# =========================================================
-
-def download_udiff(
-    session,
-    date_obj
-):
-
-    ymd = date_obj.strftime("%Y%m%d")
-
-    url = NSE_UDIFF_URL.format(
-        ymd=ymd
-    )
-
-    headers = {
-        "User-Agent": NSE_HEADERS["User-Agent"],
-        "Accept": "*/*",
-        "Referer": "https://www.nseindia.com/all-reports"
-    }
-
-    r = session.get(
-        url,
-        headers=headers,
-        timeout=30
-    )
-
-    if r.status_code != 200:
-        return None, (
-            f"UDiFF HTTP {r.status_code}"
-        )
-
-    if len(r.content) < 1000:
-        return None, "UDiFF file बहुत छोटी है"
-
-    try:
-
-        with zipfile.ZipFile(
-            io.BytesIO(r.content)
-        ) as z:
-
-            names = z.namelist()
-
-            csv_name = None
-
-            for name in names:
-
-                if name.lower().endswith(".csv"):
-
-                    csv_name = name
-                    break
-
-            if not csv_name:
-
-                return None, (
-                    "ZIP में CSV नहीं मिली"
-                )
-
-            with z.open(csv_name) as f:
-
-                text = f.read().decode(
-                    "utf-8-sig",
-                    errors="replace"
-                )
-
-                return text, None
-
-    except zipfile.BadZipFile:
-
-        return None, (
-            "NSE response ZIP नहीं है"
-        )
-
-    except Exception as e:
-
-        return None, str(e)
-
-
-# =========================================================
-# NSE REPORTS API FALLBACK
-# =========================================================
-
-def download_reports_api(
-    session,
-    date_obj
-):
-
-    archives = [{
-        "name":
-            "CM-UDiFF Common Bhavcopy Final (zip)",
-        "type":
-            "daily-reports",
-        "category":
-            "capital-market",
-        "section":
-            "equities"
-    }]
-
-    params = {
-        "archives": json.dumps(
-            archives,
-            separators=(",", ":")
-        ),
-        "date":
-            date_obj.strftime("%d-%b-%Y"),
-        "type":
-            "equities",
-        "mode":
-            "single"
-    }
-
-    headers = {
-        "User-Agent":
-            NSE_HEADERS["User-Agent"],
-        "Accept":
-            "*/*",
-        "Referer":
-            "https://www.nseindia.com/all-reports",
-        "X-Requested-With":
-            "XMLHttpRequest"
-    }
-
-    r = session.get(
-        NSE_REPORTS_URL,
-        params=params,
-        headers=headers,
-        timeout=30
-    )
-
-    if r.status_code != 200:
-
-        return None, (
-            f"NSE reports HTTP {r.status_code}"
-        )
-
-    content_type = (
-        r.headers.get(
-            "content-type",
-            ""
-        ).lower()
-    )
-
-    # Sometimes API directly returns ZIP
-    if (
-        "zip" in content_type
-        or r.content[:2] == b"PK"
-    ):
-
-        try:
-
-            with zipfile.ZipFile(
-                io.BytesIO(r.content)
-            ) as z:
-
-                names = z.namelist()
-
-                csv_name = None
-
-                for name in names:
-
-                    if name.lower().endswith(
-                        ".csv"
-                    ):
-
-                        csv_name = name
-                        break
-
-                if not csv_name:
-                    return None, (
-                        "Reports ZIP में CSV नहीं"
-                    )
-
-                with z.open(csv_name) as f:
-
-                    return (
-                        f.read().decode(
-                            "utf-8-sig",
-                            errors="replace"
-                        ),
-                        None
-                    )
-
-        except Exception as e:
-
-            return None, str(e)
-
-    # Some NSE responses contain JSON metadata
-    try:
-
-        data = r.json()
-
-        file_url = None
-
-        if isinstance(data, dict):
-
-            if "filePath" in data:
-                file_url = data["filePath"]
-
-            if "fileUrl" in data:
-                file_url = data["fileUrl"]
-
-            if "url" in data:
-                file_url = data["url"]
-
-            if "data" in data:
-                d = data["data"]
-
-                if isinstance(d, list) and d:
-
-                    first = d[0]
-
-                    if isinstance(first, dict):
-
-                        for k in (
-                            "filePath",
-                            "fileUrl",
-                            "url"
-                        ):
-
-                            if first.get(k):
-                                file_url = first[k]
-                                break
-
-        if file_url:
-
-            if file_url.startswith("/"):
-                file_url = NSE_HOME + file_url
-
-            rr = session.get(
-                file_url,
-                headers=headers,
-                timeout=30
-            )
-
-            if rr.status_code == 200:
-
-                try:
-
-                    with zipfile.ZipFile(
-                        io.BytesIO(rr.content)
-                    ) as z:
-
-                        names = z.namelist()
-
-                        for name in names:
-
-                            if name.lower().endswith(
-                                ".csv"
-                            ):
-
-                                with z.open(name) as f:
-
-                                    return (
-                                        f.read().decode(
-                                            "utf-8-sig",
-                                            errors="replace"
-                                        ),
-                                        None
-                                    )
-
-                except Exception:
-                    pass
-
-    except Exception:
-        pass
-
-    return None, (
-        "NSE reports API से file नहीं मिली"
-    )
-
-
-# =========================================================
-# PARSE UDIFF / LEGACY CSV
-# =========================================================
-
-def parse_turnover_csv(text):
-
-    if not text:
-        return {}
-
-    lines = text.splitlines()
-
-    if not lines:
-        return {}
-
-    reader = csv.DictReader(
-        io.StringIO(text)
-    )
-
-    if not reader.fieldnames:
-        return {}
-
-    headers = [
-        str(x).strip()
-        for x in reader.fieldnames
-    ]
-
-    # -----------------------------------------
-    # UDIFF
-    # -----------------------------------------
-
-    if (
-        "TckrSymb" in headers
-        and "SctySrs" in headers
-    ):
-
-        symbol_col = "TckrSymb"
-        series_col = "SctySrs"
-
-        turnover_col = None
-
-        for c in (
-            "TtlTrfVal",
-            "TtlTrdVal",
-            "Turnover"
-        ):
-
-            if c in headers:
-                turnover_col = c
-                break
-
-        if not turnover_col:
-            return {}
-
-        result = {}
-
-        for row in reader:
-
-            symbol = str(
-                row.get(
-                    symbol_col,
-                    ""
-                )
-            ).strip().upper()
-
-            series = str(
-                row.get(
-                    series_col,
-                    ""
-                )
-            ).strip().upper()
-
-            if not symbol:
-                continue
-
-            if series != "EQ":
-                continue
-
-            raw = str(
-                row.get(
-                    turnover_col,
-                    ""
-                )
-            ).strip()
-
-            try:
-
-                value = float(
-                    raw.replace(",", "")
-                )
-
-            except Exception:
-
-                continue
-
-            if value > 0:
-                result[symbol] = value
-
-        return result
-
-    # -----------------------------------------
-    # OLD FORMAT FALLBACK
-    # -----------------------------------------
-
-    if (
-        "SYMBOL" in headers
-        and "SERIES" in headers
-    ):
-
-        symbol_col = "SYMBOL"
-        series_col = "SERIES"
-
-        turnover_col = None
-
-        for c in (
-            "TOTTRDVAL",
-            "TURNOVER_LACS"
-        ):
-
-            if c in headers:
-                turnover_col = c
-                break
-
-        if not turnover_col:
-            return {}
-
-        result = {}
-
-        for row in reader:
-
-            symbol = str(
-                row.get(
-                    symbol_col,
-                    ""
-                )
-            ).strip().upper()
-
-            series = str(
-                row.get(
-                    series_col,
-                    ""
-                )
-            ).strip().upper()
-
-            if not symbol or series != "EQ":
-                continue
-
-            raw = str(
-                row.get(
-                    turnover_col,
-                    ""
-                )
-            ).strip()
-
-            try:
-
-                value = float(
-                    raw.replace(",", "")
-                )
-
-            except Exception:
-
-                continue
-
-            # Old NSE TURNOVER_LACS
-            if turnover_col == "TURNOVER_LACS":
-                value *= 100000.0
-
-            if value > 0:
-                result[symbol] = value
-
-        return result
-
-    return {}
-
-
-# =========================================================
-# ONE TRADING DAY
-# =========================================================
-
-def get_one_day_turnover(
-    session,
-    date_obj
-):
-
-    # First UDiFF archive
-    text, error1 = download_udiff(
-        session,
-        date_obj
-    )
-
-    if text:
-
-        data = parse_turnover_csv(
-            text
-        )
-
-        if data:
-            return data, "UDiFF"
-
-    # Then NSE reports API
-    text, error2 = download_reports_api(
-        session,
-        date_obj
-    )
-
-    if text:
-
-        data = parse_turnover_csv(
-            text
-        )
-
-        if data:
-            return data, "Reports API"
-
-    return {}, (
-        f"{date_obj.strftime('%d-%m-%Y')}: "
-        f"{error1}; {error2}"
-    )
-
-
-# =========================================================
-# 20 DAY AVERAGE TURNOVER
-# =========================================================
-
-def get_average_turnover():
-
-    today = now_ist().date()
-
-    if (
-        TURNOVER_CACHE["date"] == today
-        and TURNOVER_CACHE["data"]
-    ):
-
-        set_status(
-            "20-Day turnover cache से लिया जा रहा है..."
-        )
-
-        return TURNOVER_CACHE["data"]
-
-    session = create_nse_session()
-
-    sums = {}
-    counts = {}
-
-    valid_days = 0
-    checked_days = 0
-
-    errors = []
-
-    date_cursor = (
-        today - timedelta(days=1)
-    )
-
-    set_status(
-        "NSE से 20 trading days निकाले जा रहे हैं..."
-    )
-
-    while valid_days < LIQUIDITY_DAYS:
-
-        if checked_days >= 60:
-            break
-
-        checked_days += 1
-
-        day_data, source = (
-            get_one_day_turnover(
-                session,
-                date_cursor
-            )
-        )
-
-        if day_data:
-
-            valid_days += 1
-
-            set_status(
-                f"NSE turnover: "
-                f"{valid_days}/{LIQUIDITY_DAYS} "
-                f"days • {source}"
-            )
-
-            for symbol, turnover in (
-                day_data.items()
-            ):
-
-                sums[symbol] = (
-                    sums.get(symbol, 0.0)
-                    + turnover
-                )
-
-                counts[symbol] = (
-                    counts.get(symbol, 0)
-                    + 1
-                )
-
-        else:
-
-            errors.append(source)
-
-        date_cursor -= timedelta(days=1)
-
-        time.sleep(0.20)
-
-    if valid_days < LIQUIDITY_DAYS:
-
-        detail = ""
-
-        if errors:
-            detail = (
-                " | Last: "
-                + errors[-1][:350]
-            )
-
-        raise RuntimeError(
-            f"NSE से केवल {valid_days} "
-            f"valid trading days मिले, "
-            f"{LIQUIDITY_DAYS} चाहिए."
-            + detail
-        )
-
-    averages = {}
-
-    for symbol, total in sums.items():
-
-        if (
-            counts.get(symbol, 0)
-            >= LIQUIDITY_DAYS
-        ):
-
-            averages[symbol] = (
-                total
-                / LIQUIDITY_DAYS
-            )
-
-    if not averages:
-
-        raise RuntimeError(
-            "20-Day turnover averages खाली हैं."
-        )
-
-    TURNOVER_CACHE["date"] = today
-    TURNOVER_CACHE["data"] = averages
-
-    return averages
 
 
 # =========================================================
 # UPSTOX INSTRUMENTS
 # =========================================================
 
-def get_instruments():
+def load_instruments():
 
     set_status(
-        "NSE Equity list download हो रही है..."
+        "NSE Equity list Upstox से आ रही है..."
     )
 
     r = requests.get(
         INSTRUMENT_URL,
-        timeout=45
+        timeout=60
     )
 
-    r.raise_for_status()
+    if r.status_code != 200:
 
-    raw = gzip.decompress(
-        r.content
-    )
+        raise RuntimeError(
+            "Instrument list error "
+            f"{r.status_code}"
+        )
 
-    data = json.loads(
-        raw.decode("utf-8")
-    )
+    try:
+
+        raw = gzip.decompress(
+            r.content
+        )
+
+        data = json.loads(
+            raw.decode("utf-8")
+        )
+
+    except Exception as e:
+
+        raise RuntimeError(
+            "Instrument list पढ़ने में error: "
+            + str(e)
+        )
 
     stocks = []
 
-    for x in data:
+    for item in data:
 
-        if x.get("segment") != "NSE_EQ":
+        if item.get("segment") != "NSE_EQ":
             continue
 
-        if x.get("instrument_type") != "EQ":
+        if item.get("instrument_type") != "EQ":
             continue
 
-        key = x.get(
+        key = item.get(
             "instrument_key"
         )
 
-        symbol = x.get(
+        symbol = item.get(
             "trading_symbol"
         )
 
@@ -882,16 +247,20 @@ def get_instruments():
             "symbol": symbol
         })
 
+    if not stocks:
+
+        raise RuntimeError(
+            "NSE EQ instruments नहीं मिले."
+        )
+
     return stocks
 
 
 # =========================================================
-# UPSTOX LIVE QUOTES
+# LIVE QUOTES
 # =========================================================
 
-def get_live_quotes(
-    stocks
-):
+def get_live_quotes(stocks):
 
     quotes = {}
 
@@ -907,10 +276,14 @@ def get_live_quotes(
             start:start + 500
         ]
 
+        end_number = min(
+            start + 500,
+            total
+        )
+
         set_status(
-            f"Live market data: "
-            f"{min(start + 500, total)}"
-            f"/{total}"
+            f"Live data: "
+            f"{end_number}/{total}"
         )
 
         keys = ",".join(
@@ -919,51 +292,354 @@ def get_live_quotes(
         )
 
         url = (
-            f"{UPSTOX_BASE}"
-            f"/v3/market-quote/quotes"
+            BASE_URL
+            + "/v3/market-quote/quotes"
         )
 
-        r = requests.get(
-            url,
-            headers=UPSTOX_HEADERS,
-            params={
-                "instrument_key": keys
-            },
-            timeout=40
-        )
+        success = False
 
-        if r.status_code != 200:
-
-            raise RuntimeError(
-                "Upstox Live Quote error "
-                f"{r.status_code}: "
-                f"{r.text[:300]}"
-            )
-
-        payload = r.json()
-
-        data = payload.get(
-            "data",
-            {}
-        )
-
-        for response_key, q in (
-            data.items()
+        for attempt in range(
+            MAX_RETRIES
         ):
 
-            if not isinstance(
-                q,
-                dict
-            ):
-                continue
+            try:
 
-            quotes[
-                response_key
-            ] = q
+                response = requests.get(
+                    url,
+                    headers=HEADERS,
+                    params={
+                        "instrument_key": keys
+                    },
+                    timeout=45
+                )
+
+                if response.status_code == 200:
+
+                    payload = response.json()
+
+                    data = payload.get(
+                        "data",
+                        {}
+                    )
+
+                    for response_key, value in (
+                        data.items()
+                    ):
+
+                        if isinstance(
+                            value,
+                            dict
+                        ):
+
+                            quotes[
+                                response_key
+                            ] = value
+
+                    success = True
+                    break
+
+                if response.status_code == 429:
+
+                    wait = 5 + (
+                        attempt * 5
+                    )
+
+                    set_status(
+                        "Upstox rate limit — "
+                        f"{wait} sec wait..."
+                    )
+
+                    time.sleep(wait)
+                    continue
+
+                raise RuntimeError(
+                    "Upstox quote error "
+                    f"{response.status_code}: "
+                    f"{response.text[:300]}"
+                )
+
+            except requests.RequestException as e:
+
+                if attempt == (
+                    MAX_RETRIES - 1
+                ):
+
+                    raise RuntimeError(
+                        "Upstox connection error: "
+                        + str(e)
+                    )
+
+                time.sleep(
+                    3 + attempt * 2
+                )
+
+        if not success:
+
+            raise RuntimeError(
+                "Live quote batch complete "
+                "नहीं हो पाया."
+            )
 
         time.sleep(0.15)
 
+    if not quotes:
+
+        raise RuntimeError(
+            "Upstox से कोई live quote नहीं मिला."
+        )
+
     return quotes
+
+
+# =========================================================
+# HISTORICAL DAILY DATA
+# =========================================================
+
+def get_history_for_stock(
+    instrument_key
+):
+
+    today = now_ist().date()
+
+    # We deliberately go back enough days
+    # to collect at least 20 trading sessions.
+    to_date = (
+        today - timedelta(days=1)
+    )
+
+    from_date = (
+        today - timedelta(days=55)
+    )
+
+    key_encoded = quote(
+        instrument_key,
+        safe=""
+    )
+
+    url = (
+        BASE_URL
+        + "/v3/historical-candle/"
+        + key_encoded
+        + "/days/1/"
+        + to_date.strftime("%Y-%m-%d")
+        + "/"
+        + from_date.strftime("%Y-%m-%d")
+    )
+
+    for attempt in range(
+        MAX_RETRIES
+    ):
+
+        try:
+
+            response = requests.get(
+                url,
+                headers=HEADERS,
+                timeout=45
+            )
+
+            if response.status_code == 200:
+
+                payload = response.json()
+
+                candles = (
+                    payload
+                    .get("data", {})
+                    .get("candles", [])
+                )
+
+                return candles
+
+            if response.status_code == 429:
+
+                wait = 5 + (
+                    attempt * 5
+                )
+
+                time.sleep(wait)
+                continue
+
+            # A single stock failure should
+            # not stop the complete scanner.
+            return []
+
+        except requests.RequestException:
+
+            if attempt == (
+                MAX_RETRIES - 1
+            ):
+
+                return []
+
+            time.sleep(
+                3 + attempt * 2
+            )
+
+    return []
+
+
+# =========================================================
+# 20-DAY AVERAGE TURNOVER
+# =========================================================
+
+def calculate_average_turnover(
+    candles
+):
+
+    if not candles:
+        return None
+
+    rows = []
+
+    for candle in candles:
+
+        if not isinstance(
+            candle,
+            list
+        ):
+            continue
+
+        if len(candle) < 6:
+            continue
+
+        try:
+
+            timestamp = candle[0]
+
+            close_price = float(
+                candle[4]
+            )
+
+            volume = float(
+                candle[5]
+            )
+
+            if close_price <= 0:
+                continue
+
+            if volume <= 0:
+                continue
+
+            turnover = (
+                close_price * volume
+            )
+
+            rows.append({
+                "timestamp":
+                    timestamp,
+                "turnover":
+                    turnover
+            })
+
+        except Exception:
+
+            continue
+
+    if not rows:
+        return None
+
+    # Sort by date newest first.
+    rows.sort(
+        key=lambda x:
+            x["timestamp"],
+        reverse=True
+    )
+
+    rows = rows[
+        :LIQUIDITY_DAYS
+    ]
+
+    if len(rows) < LIQUIDITY_DAYS:
+        return None
+
+    total = sum(
+        x["turnover"]
+        for x in rows
+    )
+
+    return (
+        total
+        / LIQUIDITY_DAYS
+    )
+
+
+def get_all_average_turnovers(
+    candidates
+):
+
+    today = now_ist().date()
+
+    # Use same-day cache.
+    if (
+        TURNOVER_CACHE["date"] == today
+        and TURNOVER_CACHE["data"]
+    ):
+
+        set_status(
+            "20-Day turnover cache से लिया जा रहा है..."
+        )
+
+        return TURNOVER_CACHE["data"]
+
+    result = {}
+
+    total = len(candidates)
+
+    set_status(
+        f"20-Day data शुरू: "
+        f"0/{total}"
+    )
+
+    for index, stock in enumerate(
+        candidates,
+        1
+    ):
+
+        symbol = stock["symbol"]
+        key = stock["key"]
+
+        candles = get_history_for_stock(
+            key
+        )
+
+        average = (
+            calculate_average_turnover(
+                candles
+            )
+        )
+
+        if average is not None:
+
+            result[symbol] = average
+
+        set_progress(
+            index,
+            total
+        )
+
+        set_status(
+            f"20-Day turnover: "
+            f"{index}/{total} • "
+            f"{symbol}"
+        )
+
+        # Keep well below the
+        # 500/minute standard limit.
+        time.sleep(
+            HISTORY_DELAY
+        )
+
+    if not result:
+
+        raise RuntimeError(
+            "किसी भी stock का "
+            "20-Day historical data नहीं मिला."
+        )
+
+    TURNOVER_CACHE["date"] = today
+    TURNOVER_CACHE["data"] = result
+
+    return result
 
 
 # =========================================================
@@ -975,12 +651,14 @@ def perform_scan():
     with LOCK:
 
         STATE["running"] = True
-        STATE["results"] = []
-        STATE["error"] = None
-        STATE["last_scan"] = None
         STATE["status"] = (
             "Scan शुरू हो रहा है..."
         )
+        STATE["last_scan"] = None
+        STATE["results"] = []
+        STATE["error"] = None
+        STATE["progress"] = 0
+        STATE["total"] = 0
 
     try:
 
@@ -992,111 +670,53 @@ def perform_scan():
             )
 
         # -----------------------------------------
-        # 1. Instruments
+        # 1. INSTRUMENTS
         # -----------------------------------------
 
-        stocks = get_instruments()
-
-        if not stocks:
-
-            raise RuntimeError(
-                "NSE Equity instruments नहीं मिले."
-            )
+        stocks = load_instruments()
 
         # -----------------------------------------
-        # 2. Live quotes
+        # 2. LIVE QUOTES
         # -----------------------------------------
 
         quotes = get_live_quotes(
             stocks
         )
 
-        if not quotes:
-
-            raise RuntimeError(
-                "Upstox से Live Quotes नहीं मिले."
-            )
-
         # -----------------------------------------
-        # 3. NSE 20-day turnover
+        # 3. FIRST FILTER
         # -----------------------------------------
+        #
+        # Only Price >= ₹50.
+        #
+        # Average turnover is NOT a hard filter.
+        # It contributes only 10% score.
+        #
 
-        avg_turnover = (
-            get_average_turnover()
-        )
-
-        # -----------------------------------------
-        # 4. Scoring
-        # -----------------------------------------
-
-        set_status(
-            "Strength Score calculate हो रहा है..."
-        )
-
-        results = []
+        candidates = []
 
         for stock in stocks:
 
-            symbol = stock[
-                "symbol"
-            ]
+            symbol = stock["symbol"]
 
-            key = stock[
-                "key"
-            ]
-
-            response_key = (
+            quote_key = (
                 "NSE_EQ:"
                 + symbol
             )
 
             q = quotes.get(
-                response_key
+                quote_key
             )
 
             if not q:
                 continue
 
-            ltp = q.get(
-                "last_price"
-            )
-
-            prev_close = q.get(
-                "prev_close_price"
-            )
-
-            volume = q.get(
-                "volume",
-                0
-            )
-
-            ohlc = q.get(
-                "ohlc",
-                {}
-            ) or {}
-
-            open_price = ohlc.get(
-                "open"
-            )
-
-            low_price = ohlc.get(
-                "low"
-            )
-
             try:
 
-                ltp = float(ltp)
-                prev_close = float(
-                    prev_close
-                )
-                volume = float(
-                    volume or 0
-                )
-                open_price = float(
-                    open_price
-                )
-                low_price = float(
-                    low_price
+                ltp = float(
+                    q.get(
+                        "last_price"
+                    )
                 )
 
             except Exception:
@@ -1106,8 +726,111 @@ def perform_scan():
             if ltp < MIN_PRICE:
                 continue
 
+            candidates.append(
+                stock
+            )
+
+        if not candidates:
+
+            raise RuntimeError(
+                "₹50 या उससे ऊपर का "
+                "कोई NSE EQ stock नहीं मिला."
+            )
+
+        set_status(
+            f"₹50+ candidates: "
+            f"{len(candidates)}"
+        )
+
+        # -----------------------------------------
+        # 4. 20-DAY HISTORICAL TURNOVER
+        # -----------------------------------------
+
+        average_turnovers = (
+            get_all_average_turnovers(
+                candidates
+            )
+        )
+
+        # -----------------------------------------
+        # 5. FINAL SCORE
+        # -----------------------------------------
+
+        set_status(
+            "Final Strength Rank calculate हो रही है..."
+        )
+
+        results = []
+
+        total_candidates = len(
+            candidates
+        )
+
+        for index, stock in enumerate(
+            candidates,
+            1
+        ):
+
+            symbol = stock[
+                "symbol"
+            ]
+
+            quote_key = (
+                "NSE_EQ:"
+                + symbol
+            )
+
+            q = quotes.get(
+                quote_key
+            )
+
+            if not q:
+                continue
+
+            try:
+
+                ltp = float(
+                    q.get(
+                        "last_price"
+                    )
+                )
+
+                previous_close = float(
+                    q.get(
+                        "prev_close_price"
+                    )
+                )
+
+                ohlc = q.get(
+                    "ohlc",
+                    {}
+                ) or {}
+
+                open_price = float(
+                    ohlc.get(
+                        "open"
+                    )
+                )
+
+                low_price = float(
+                    ohlc.get(
+                        "low"
+                    )
+                )
+
+                volume = float(
+                    q.get(
+                        "volume",
+                        0
+                    ) or 0
+                )
+
+            except Exception:
+
+                continue
+
             average_turnover = (
-                avg_turnover.get(
+                average_turnovers.get(
                     symbol
                 )
             )
@@ -1116,77 +839,76 @@ def perform_scan():
                 continue
 
             if (
-                average_turnover
-                < MIN_AVG_TURNOVER
+                open_price <= 0
+                or low_price <= 0
+                or previous_close <= 0
             ):
                 continue
 
-            if open_price <= 0:
-                continue
-
-            if low_price <= 0:
-                continue
-
-            if prev_close <= 0:
-                continue
-
             # ---------------------------------
-            # Scores
+            # COMPONENT SCORES
             # ---------------------------------
 
-            gap_score = score_gap(
+            s_gap = gap_score(
                 open_price,
                 low_price
             )
 
-            recovery_score = (
-                score_recovery(
-                    ltp,
-                    low_price
-                )
+            s_recovery = recovery_score(
+                ltp,
+                low_price
             )
 
-            gain_score = score_gain(
+            s_gain = gain_score(
                 ltp,
-                prev_close
+                previous_close
             )
 
             live_turnover = (
                 volume * ltp
             )
 
-            live_score = (
-                score_live_turnover(
+            s_live = (
+                live_turnover_score(
                     live_turnover,
                     average_turnover
                 )
             )
 
-            avg_score = (
-                score_avg_turnover(
+            s_average = (
+                average_turnover_score(
                     average_turnover
                 )
             )
 
             # ---------------------------------
-            # FINAL RANK
+            # FINAL SCORE
             # ---------------------------------
 
             strength = (
-                gap_score * W_GAP
-                + recovery_score
-                * W_RECOVERY
-                + gain_score
-                * W_GAIN
-                + live_score
-                * W_LIVE
-                + avg_score
-                * W_AVG
+
+                s_gap
+                * GAP_WEIGHT
+
+                + s_recovery
+                * RECOVERY_WEIGHT
+
+                + s_gain
+                * GAIN_WEIGHT
+
+                + s_live
+                * LIVE_TURNOVER_WEIGHT
+
+                + s_average
+                * AVERAGE_TURNOVER_WEIGHT
             )
 
             gain_percent = (
-                (ltp - prev_close)
-                / prev_close
+                (
+                    ltp
+                    - previous_close
+                )
+                / previous_close
             ) * 100.0
 
             results.append({
@@ -1224,42 +946,51 @@ def perform_scan():
                         2
                     ),
 
-                "avg_turnover":
-                    round(
-                        average_turnover,
-                        0
-                    ),
-
                 "gap_score":
                     round(
-                        gap_score,
+                        s_gap,
                         2
                     ),
 
                 "recovery_score":
                     round(
-                        recovery_score,
+                        s_recovery,
                         2
                     ),
 
                 "gain_score":
                     round(
-                        gain_score,
+                        s_gain,
                         2
                     ),
 
                 "live_score":
                     round(
-                        live_score,
+                        s_live,
                         2
                     ),
 
-                "avg_score":
+                "average_score":
                     round(
-                        avg_score,
+                        s_average,
                         2
+                    ),
+
+                "average_turnover":
+                    round(
+                        average_turnover,
+                        0
                     )
             })
+
+            set_progress(
+                index,
+                total_candidates
+            )
+
+        # -----------------------------------------
+        # 6. SORT
+        # -----------------------------------------
 
         results.sort(
             key=lambda x:
@@ -1267,12 +998,17 @@ def perform_scan():
             reverse=True
         )
 
-        for i, item in enumerate(
+        # Add rank
+        for rank, item in enumerate(
             results,
             1
         ):
 
-            item["rank"] = i
+            item["rank"] = rank
+
+        # -----------------------------------------
+        # 7. SAVE
+        # -----------------------------------------
 
         with LOCK:
 
@@ -1285,8 +1021,16 @@ def perform_scan():
             )
 
             STATE["status"] = (
-                f"Scan complete — "
+                "Scan complete — "
                 f"{len(results)} stocks found"
+            )
+
+            STATE["progress"] = (
+                total_candidates
+            )
+
+            STATE["total"] = (
+                total_candidates
             )
 
     except Exception as e:
@@ -1310,7 +1054,7 @@ def perform_scan():
 # HTML
 # =========================================================
 
-HTML = """
+HTML = r"""
 <!DOCTYPE html>
 
 <html lang="hi">
@@ -1372,6 +1116,21 @@ font-size:18px;
 margin-bottom:12px;
 }
 
+.progress{
+height:8px;
+background:#27313c;
+border-radius:10px;
+overflow:hidden;
+margin-top:12px;
+}
+
+.progressbar{
+height:100%;
+width:0%;
+background:#3b82f6;
+transition:width .4s;
+}
+
 button{
 background:#2563b9;
 color:white;
@@ -1421,10 +1180,11 @@ overflow-x:auto;
 table{
 width:100%;
 border-collapse:collapse;
-min-width:650px;
+min-width:700px;
 }
 
-th,td{
+th,
+td{
 padding:12px 10px;
 border-bottom:1px solid #27313c;
 text-align:left;
@@ -1442,6 +1202,12 @@ border-radius:10px;
 margin-top:12px;
 }
 
+.note{
+color:#9ca8b5;
+font-size:14px;
+line-height:1.5;
+}
+
 </style>
 
 </head>
@@ -1449,6 +1215,7 @@ margin-top:12px;
 <body>
 
 <div class="container">
+
 
 <div class="header">
 
@@ -1475,11 +1242,22 @@ Last Scan:
 <strong id="lastScan">--</strong>
 </div>
 
+<div class="progress">
+
+<div id="progressbar"
+class="progressbar">
+</div>
+
+</div>
+
 <br>
 
-<button id="scanBtn"
+<button
+id="scanBtn"
 onclick="startScan()">
+
 Scan Now
+
 </button>
 
 <div id="error"></div>
@@ -1489,35 +1267,84 @@ Scan Now
 
 <div class="weights">
 
-<div class="box">
-<div class="label">Price</div>
-<div class="value">≥ ₹50</div>
-</div>
 
 <div class="box">
-<div class="label">Gap Weight</div>
-<div class="value">5%</div>
+
+<div class="label">
+Price
 </div>
 
-<div class="box">
-<div class="label">Recovery</div>
-<div class="value">20%</div>
+<div class="value">
+≥ ₹50
 </div>
 
-<div class="box">
-<div class="label">Gain</div>
-<div class="value">35%</div>
 </div>
 
-<div class="box">
-<div class="label">Live Turnover</div>
-<div class="value">30%</div>
-</div>
 
 <div class="box">
-<div class="label">Average Turnover</div>
-<div class="value">10%</div>
+
+<div class="label">
+Gap Weight
 </div>
+
+<div class="value">
+5%
+</div>
+
+</div>
+
+
+<div class="box">
+
+<div class="label">
+Recovery
+</div>
+
+<div class="value">
+20%
+</div>
+
+</div>
+
+
+<div class="box">
+
+<div class="label">
+Gain
+</div>
+
+<div class="value">
+35%
+</div>
+
+</div>
+
+
+<div class="box">
+
+<div class="label">
+Live Turnover
+</div>
+
+<div class="value">
+30%
+</div>
+
+</div>
+
+
+<div class="box">
+
+<div class="label">
+Average Turnover
+</div>
+
+<div class="value">
+10%
+</div>
+
+</div>
+
 
 </div>
 
@@ -1525,9 +1352,14 @@ Scan Now
 <div class="panel">
 
 <div class="results-title">
+
 Results:
-<span id="count">0</span>
+<span id="count">
+0
+</span>
+
 </div>
+
 
 <div class="table-wrap">
 
@@ -1536,23 +1368,48 @@ Results:
 <thead>
 
 <tr>
-<th>Rank</th>
-<th>Share</th>
-<th>Strength</th>
-<th>LTP</th>
-<th>Open</th>
-<th>Low</th>
-<th>Gain</th>
+
+<th>
+Rank
+</th>
+
+<th>
+Share
+</th>
+
+<th>
+Strength
+</th>
+
+<th>
+LTP
+</th>
+
+<th>
+Open
+</th>
+
+<th>
+Low
+</th>
+
+<th>
+Gain
+</th>
+
 </tr>
 
 </thead>
 
+
 <tbody id="tbody">
 
 <tr>
+
 <td colspan="7">
 कोई result नहीं
 </td>
+
 </tr>
 
 </tbody>
@@ -1579,10 +1436,6 @@ Ranking Logic
 </p>
 
 <p>
-• 20-Day Average Turnover ≥ ₹10 Crore
-</p>
-
-<p>
 • Open-Low Gap = 5%
 </p>
 
@@ -1602,7 +1455,13 @@ Ranking Logic
 • Average Turnover = 10%
 </p>
 
+<p class="note">
+20-Day Average Turnover अब अलग hard filter नहीं है।
+यह केवल 10% score component है।
+</p>
+
 </div>
+
 
 </div>
 
@@ -1613,24 +1472,29 @@ async function loadResults(){
 
 try{
 
-const r =
+const response =
 await fetch(
 "/api/results",
-{cache:"no-store"}
+{
+cache:"no-store"
+}
 );
 
 const data =
-await r.json();
+await response.json();
+
 
 document.getElementById(
 "status"
 ).innerText =
 data.status || "Ready";
 
+
 document.getElementById(
 "lastScan"
 ).innerText =
 data.last_scan || "--";
+
 
 document.getElementById(
 "count"
@@ -1639,33 +1503,66 @@ data.results
 ? data.results.length
 : 0;
 
+
 const errorBox =
 document.getElementById(
 "error"
 );
 
+
 if(data.error){
 
 errorBox.innerHTML =
 '<div class="error">'
-+ data.error +
++
+data.error
++
 '</div>';
 
 }else{
 
-errorBox.innerHTML = "";
+errorBox.innerHTML =
+"";
+
+}
+
+
+const button =
+document.getElementById(
+"scanBtn"
+);
+
+button.disabled =
+data.running;
+
+
+let percent = 0;
+
+if(
+data.total &&
+data.total > 0
+){
+
+percent =
+(
+data.progress
+/
+data.total
+) * 100;
 
 }
 
 document.getElementById(
-"scanBtn"
-).disabled =
-data.running;
+"progressbar"
+).style.width =
+percent + "%";
+
 
 const tbody =
 document.getElementById(
 "tbody"
 );
+
 
 if(
 !data.results ||
@@ -1673,14 +1570,16 @@ data.results.length === 0
 ){
 
 tbody.innerHTML =
-'<tr><td colspan="7">'
-+
-'कोई result नहीं'
-+
-'</td></tr>';
+'<tr>' +
+'<td colspan="7">' +
+'कोई result नहीं' +
+'</td>' +
+'</tr>';
 
 return;
+
 }
+
 
 tbody.innerHTML =
 data.results.map(
@@ -1689,15 +1588,21 @@ x => `
 <tr>
 
 <td>
-<strong>${x.rank}</strong>
+<strong>
+${x.rank}
+</strong>
 </td>
 
 <td>
-<strong>${x.symbol}</strong>
+<strong>
+${x.symbol}
+</strong>
 </td>
 
 <td>
-<strong>${x.strength}</strong>
+<strong>
+${x.strength}
+</strong>
 </td>
 
 <td>
@@ -1721,12 +1626,13 @@ ${x.gain}%
 `
 ).join("");
 
-}catch(e){
+
+}catch(error){
 
 document.getElementById(
 "status"
 ).innerText =
-"Server response नहीं मिला";
+"Server response नहीं मिला.";
 
 }
 
@@ -1735,17 +1641,25 @@ document.getElementById(
 
 async function startScan(){
 
-const btn =
+const button =
 document.getElementById(
 "scanBtn"
 );
 
-btn.disabled = true;
+button.disabled = true;
+
 
 document.getElementById(
 "status"
 ).innerText =
 "Scan शुरू हो रहा है...";
+
+
+document.getElementById(
+"error"
+).innerHTML =
+"";
+
 
 try{
 
@@ -1756,12 +1670,12 @@ method:"POST"
 }
 );
 
-}catch(e){
+}catch(error){
 
 document.getElementById(
 "status"
 ).innerText =
-"Scan request failed";
+"Scan request failed.";
 
 }
 
@@ -1776,6 +1690,7 @@ loadResults,
 );
 
 </script>
+
 
 </body>
 
@@ -1845,7 +1760,13 @@ def api_results():
                 STATE["results"],
 
             "error":
-                STATE["error"]
+                STATE["error"],
+
+            "progress":
+                STATE["progress"],
+
+            "total":
+                STATE["total"]
         })
 
 
