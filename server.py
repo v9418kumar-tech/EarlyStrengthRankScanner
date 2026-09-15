@@ -1,137 +1,198 @@
-from flask import Flask, jsonify, render_template_string
-import requests, os, json, gzip, threading, time
+import os
+import json
+import gzip
+import math
+import time
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
+from flask import Flask, render_template_string, jsonify
 
 app = Flask(__name__)
 
 TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
-BASE = "https://api.upstox.com"
+
+QUOTE_URL = "https://api.upstox.com/v3/market-quote/quotes"
+HIST_URL = "https://api.upstox.com/v3/historical-candle"
+
 INSTRUMENT_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
 
-MIN_PRICE = 50.0
+PRICE_MIN = 50
+HISTORY_DAYS = 20
 TOP_HISTORY = 250
-DAYS = 20
+WORKERS = 6
 
-WGAP = 0.05
-WREC = 0.20
-WGAIN = 0.35
-WLIVE = 0.30
-WAVG = 0.10
+AVG_TURNOVER_BASE = 100_000_000
+LIVE_TURNOVER_MULTIPLIER = 2.5
 
-IST = ZoneInfo("Asia/Kolkata")
-
-HEADERS = {
-    "Accept": "application/json",
-    "Authorization": f"Bearer {TOKEN}"
-}
-
-STATE = {
-    "running": False,
-    "status": "Ready",
-    "last_scan": None,
+cache = {
+    "instruments": None,
+    "history": {},
+    "history_date": None,
     "results": [],
-    "error": None,
-    "progress": 0,
-    "total": 0
+    "status": "Ready"
 }
 
-LOCK = threading.Lock()
+HTML = """
+<!doctype html>
+<html lang="hi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Early Strength Rank Scanner</title>
+<style>
+*{box-sizing:border-box}
+body{
+ margin:0;padding:10px;
+ background:#0d141b;color:#edf2f7;
+ font-family:Arial,sans-serif
+}
+h1{font-size:25px;margin:8px 0}
+button{
+ width:100%;padding:14px;border:0;border-radius:10px;
+ background:#198754;color:white;font-size:18px;font-weight:bold;
+ margin:8px 0
+}
+.info{
+ background:#151f29;border-radius:12px;padding:12px;
+ margin:8px 0;font-size:14px;line-height:1.6
+}
+.status{
+ background:#18232e;border-radius:10px;padding:10px;
+ margin:8px 0;color:#cbd5df
+}
+.tablewrap{overflow-x:auto}
+table{
+ width:100%;border-collapse:collapse;
+ min-width:760px;background:#121b24
+}
+th,td{
+ padding:10px 8px;border-bottom:1px solid #26323d;
+ text-align:left;white-space:nowrap
+}
+th{color:#aeb9c5;font-size:14px}
+td{font-size:14px}
+.rank{font-weight:bold}
+.score{font-weight:bold;color:#66e3a1}
+.gain{color:#66e3a1}
+.neg{color:#ff7777}
+.small{font-size:12px;color:#8e9aa6}
+</style>
+</head>
 
-# Same-day cache.
-HISTORY_CACHE = {
-    "date": None,
-    "data": {}
+<body>
+<h1>Early Strength Rank Scanner</h1>
+
+<div class="info">
+<b>Final Ranking Weights</b><br>
+Open-Low Gap: 5% |
+Recovery: 20% |
+Gain: 35% |
+Live Turnover: 30% |
+20-Day Average Turnover: 10%
+</div>
+
+<button onclick="scan()">SCAN NOW</button>
+
+<div id="status" class="status">Ready</div>
+
+<div id="results"></div>
+
+<script>
+async function scan(){
+ const s=document.getElementById("status");
+ s.innerHTML="Scan शुरू हो रहा है...";
+ document.getElementById("results").innerHTML="";
+
+ try{
+   const r=await fetch("/scan");
+   const d=await r.json();
+
+   if(d.error){
+      s.innerHTML="ERROR: "+d.error;
+      return;
+   }
+
+   s.innerHTML=
+      "Results: "+d.results.length+
+      " | Updated: "+d.time;
+
+   let h="<div class='tablewrap'><table>";
+   h+="<tr>"+
+      "<th>Rank</th>"+
+      "<th>Share</th>"+
+      "<th>Strength</th>"+
+      "<th>LTP</th>"+
+      "<th>Open</th>"+
+      "<th>Low</th>"+
+      "<th>Gain</th>"+
+      "<th>Live Turnover</th>"+
+      "<th>Avg Turnover</th>"+
+      "</tr>";
+
+   d.results.forEach((x,i)=>{
+      let gc=x.gain>=0?"gain":"neg";
+
+      h+="<tr>"+
+        "<td class='rank'>"+(i+1)+"</td>"+
+        "<td><b>"+x.symbol+"</b></td>"+
+        "<td class='score'>"+x.strength.toFixed(2)+"</td>"+
+        "<td>₹"+x.ltp.toFixed(2)+"</td>"+
+        "<td>₹"+x.open.toFixed(2)+"</td>"+
+        "<td>₹"+x.low.toFixed(2)+"</td>"+
+        "<td class='"+gc+"'>"+x.gain.toFixed(2)+"%</td>"+
+        "<td>₹"+fmt(x.live_turnover)+"</td>"+
+        "<td>₹"+fmt(x.avg_turnover)+"</td>"+
+        "</tr>";
+   });
+
+   h+="</table></div>";
+   document.getElementById("results").innerHTML=h;
+
+ }catch(e){
+   s.innerHTML="ERROR: "+e;
+ }
 }
 
+function fmt(n){
+ if(n>=10000000) return (n/10000000).toFixed(2)+" Cr";
+ if(n>=100000) return (n/100000).toFixed(2)+" L";
+ if(n>=1000) return (n/1000).toFixed(1)+" K";
+ return n.toFixed(0);
+}
+</script>
+</body>
+</html>
+"""
 
-def now():
-    return datetime.now(IST)
-
-
-def status(text):
-    with LOCK:
-        STATE["status"] = text
-
-
-def progress(done, total):
-    with LOCK:
-        STATE["progress"] = done
-        STATE["total"] = total
-
-
-def clamp(x):
-    return max(0.0, min(100.0, x))
+def headers():
+    return {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {TOKEN}"
+    }
 
 
-# ---------------------------------------------------------
-# SCORE FUNCTIONS
-# ---------------------------------------------------------
-
-def gap_score(o, l):
-    if o <= 0:
-        return 0
-    gap = ((o - l) / o) * 100
-    return clamp((1 - gap / 0.50) * 100)
+def clamp_nonnegative(x):
+    try:
+        return max(0.0, float(x))
+    except:
+        return 0.0
 
 
-def recovery_score(c, l):
-    if l <= 0:
-        return 0
-    recovery = ((c - l) / l) * 100
-    return clamp((recovery / 1.50) * 100)
+def load_instruments():
+    if cache["instruments"] is not None:
+        return cache["instruments"]
 
-
-def gain_score(c, pc):
-    if pc <= 0:
-        return 0
-    gain = ((c - pc) / pc) * 100
-    return clamp((gain / 3.00) * 100)
-
-
-def live_score(live_turnover, avg_turnover):
-    if avg_turnover <= 0:
-        return 0
-    return clamp(
-        live_turnover /
-        (avg_turnover * 2.5) * 100
-    )
-
-
-def avg_score(avg_turnover):
-    return clamp(
-        avg_turnover /
-        100000000 * 100
-    )
-
-
-# ---------------------------------------------------------
-# INSTRUMENTS
-# ---------------------------------------------------------
-
-def instruments():
-
-    status("Upstox NSE Equity list download हो रही है...")
-
-    r = requests.get(
-        INSTRUMENT_URL,
-        timeout=60
-    )
-
-    if r.status_code != 200:
-        raise RuntimeError(
-            f"Instrument list error {r.status_code}"
-        )
+    r = requests.get(INSTRUMENT_URL, timeout=30)
+    r.raise_for_status()
 
     raw = gzip.decompress(r.content)
     data = json.loads(raw.decode("utf-8"))
 
-    stocks = []
+    instruments = []
 
     for x in data:
-
         if x.get("segment") != "NSE_EQ":
             continue
 
@@ -141,1146 +202,447 @@ def instruments():
         key = x.get("instrument_key")
         symbol = x.get("trading_symbol")
 
-        if key and symbol:
-            stocks.append({
+        if not key or not symbol:
+            continue
+
+        instruments.append({
+            "key": key,
+            "symbol": symbol
+        })
+
+    cache["instruments"] = instruments
+    return instruments
+
+
+def get_quotes(instruments):
+    all_data = []
+
+    for i in range(0, len(instruments), 500):
+        batch = instruments[i:i+500]
+        keys = ",".join(x["key"] for x in batch)
+
+        r = requests.get(
+            QUOTE_URL,
+            headers=headers(),
+            params={"instrument_key": keys},
+            timeout=30
+        )
+
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"Upstox Quote HTTP {r.status_code}: {r.text[:300]}"
+            )
+
+        j = r.json()
+        data = j.get("data", {})
+
+        for key, q in data.items():
+            if not isinstance(q, dict):
+                continue
+
+            symbol = q.get("symbol")
+            ltp = q.get("last_price")
+            prev = q.get("prev_close_price")
+
+            ohlc = q.get("ohlc") or {}
+
+            op = ohlc.get("open")
+            low = ohlc.get("low")
+            volume = q.get("volume", ohlc.get("volume", 0))
+
+            try:
+                ltp = float(ltp)
+                prev = float(prev)
+                op = float(op)
+                low = float(low)
+                volume = float(volume or 0)
+            except:
+                continue
+
+            if ltp < PRICE_MIN:
+                continue
+
+            if op <= 0 or low <= 0 or prev <= 0:
+                continue
+
+            all_data.append({
                 "key": key,
-                "symbol": symbol
+                "symbol": symbol,
+                "ltp": ltp,
+                "prev": prev,
+                "open": op,
+                "low": low,
+                "volume": volume
             })
 
-    if not stocks:
-        raise RuntimeError(
-            "NSE EQ instruments नहीं मिले"
-        )
-
-    return stocks
+    return all_data
 
 
-# ---------------------------------------------------------
-# LIVE QUOTES
-# ---------------------------------------------------------
+def preliminary_score(x):
+    """
+    केवल Top-250 चुनने के लिए preliminary score.
+    यह final score नहीं है.
+    """
 
-def live_quotes(stocks):
+    op = x["open"]
+    low = x["low"]
+    ltp = x["ltp"]
+    prev = x["prev"]
 
-    result = {}
-    total = len(stocks)
+    gap = ((op - low) / op) * 100
+    recovery = ((ltp - low) / low) * 100
+    gain = ((ltp - prev) / prev) * 100
 
-    for start in range(0, total, 500):
+    # Open-Low: 0% gap = 100 score.
+    gap_score = max(0.0, (1 - gap / 0.50) * 100)
 
-        batch = stocks[start:start + 500]
+    # IMPORTANT:
+    # अब recovery/gain/live turnover को 100 पर cap नहीं किया गया.
+    recovery_score = max(0.0, (recovery / 1.50) * 100)
+    gain_score = max(0.0, (gain / 3.00) * 100)
 
-        status(
-            f"Live market data: "
-            f"{min(start + 500,total)}/{total}"
-        )
+    live_turnover = x["volume"] * ltp
 
-        keys = ",".join(
-            x["key"] for x in batch
-        )
-
-        url = (
-            BASE +
-            "/v3/market-quote/quotes"
-        )
-
-        for attempt in range(4):
-
-            r = requests.get(
-                url,
-                headers=HEADERS,
-                params={
-                    "instrument_key": keys
-                },
-                timeout=45
-            )
-
-            if r.status_code == 200:
-                data = r.json().get(
-                    "data", {}
-                )
-
-                result.update(data)
-                break
-
-            if r.status_code == 429:
-                time.sleep(5 + attempt * 5)
-                continue
-
-            raise RuntimeError(
-                f"Upstox quote error "
-                f"{r.status_code}: "
-                f"{r.text[:250]}"
-            )
-
-        time.sleep(0.15)
-
-    if not result:
-        raise RuntimeError(
-            "Live quotes नहीं मिले"
-        )
-
-    return result
-
-
-# ---------------------------------------------------------
-# HISTORICAL 20 DAY DATA
-# ---------------------------------------------------------
-
-def history_one(stock):
-
-    key = stock["key"]
-    symbol = stock["symbol"]
-
-    today = now().date()
-
-    to_date = today - timedelta(days=1)
-    from_date = today - timedelta(days=55)
-
-    encoded = quote(
-        key,
-        safe=""
+    # केवल preliminary ranking.
+    # Final calculation में Avg Turnover उपलब्ध होने पर
+    # exact Live Turnover Score निकलेगा.
+    live_score = max(
+        0.0,
+        (live_turnover / 250_000_000) * 100
     )
+
+    return (
+        gap_score * 0.05 +
+        recovery_score * 0.20 +
+        gain_score * 0.35 +
+        live_score * 0.30
+    )
+
+
+def get_history(x):
+    key = x["key"]
+
+    today = datetime.now().date()
+
+    # आज की incomplete candle को छोड़कर
+    # पिछले लगभग 30 calendar days में से
+    # कम-से-कम 20 completed trading candles लेने की कोशिश.
+    to_date = today - timedelta(days=1)
+    from_date = today - timedelta(days=35)
 
     url = (
-        BASE +
-        "/v3/historical-candle/" +
-        encoded +
-        "/days/1/" +
-        to_date.strftime("%Y-%m-%d") +
-        "/" +
-        from_date.strftime("%Y-%m-%d")
+        f"{HIST_URL}/"
+        f"{key}/days/1/"
+        f"{to_date.isoformat()}/"
+        f"{from_date.isoformat()}"
     )
 
     try:
-
-        for attempt in range(4):
-
-            r = requests.get(
-                url,
-                headers=HEADERS,
-                timeout=40
-            )
-
-            if r.status_code == 200:
-
-                candles = (
-                    r.json()
-                    .get("data", {})
-                    .get("candles", [])
-                )
-
-                rows = []
-
-                for candle in candles:
-
-                    if len(candle) < 6:
-                        continue
-
-                    try:
-
-                        close = float(candle[4])
-                        volume = float(candle[5])
-
-                        if close > 0 and volume > 0:
-
-                            rows.append(
-                                close * volume
-                            )
-
-                    except:
-                        continue
-
-                if len(rows) >= DAYS:
-
-                    rows = rows[:DAYS]
-
-                    average = (
-                        sum(rows) / DAYS
-                    )
-
-                    return symbol, average
-
-                return symbol, None
-
-            if r.status_code == 429:
-
-                time.sleep(
-                    5 + attempt * 5
-                )
-
-                continue
-
-            return symbol, None
-
-    except Exception:
-
-        return symbol, None
-
-    return symbol, None
-
-
-def historical_top(candidates):
-
-    today = now().date()
-
-    if (
-        HISTORY_CACHE["date"] == today
-        and HISTORY_CACHE["data"]
-    ):
-
-        status(
-            "20-Day turnover cache से लिया जा रहा है..."
+        r = requests.get(
+            url,
+            headers=headers(),
+            timeout=30
         )
 
-        return HISTORY_CACHE["data"]
+        if r.status_code != 200:
+            return key, None
 
-    total = len(candidates)
+        candles = r.json().get("data", {}).get("candles", [])
 
-    status(
-        f"Top {total} shares का 20-Day data..."
-    )
+        rows = []
 
-    result = {}
-    done = 0
-
-    # Six parallel workers.
-    # This keeps request speed high while
-    # staying around normal API capacity.
-    with ThreadPoolExecutor(
-        max_workers=6
-    ) as executor:
-
-        futures = [
-            executor.submit(
-                history_one,
-                stock
-            )
-            for stock in candidates
-        ]
-
-        for future in as_completed(
-            futures
-        ):
-
-            symbol, average = (
-                future.result()
-            )
-
-            if average:
-                result[symbol] = average
-
-            done += 1
-
-            progress(
-                done,
-                total
-            )
-
-            status(
-                f"20-Day turnover: "
-                f"{done}/{total} • {symbol}"
-            )
-
-    if not result:
-        raise RuntimeError(
-            "20-Day historical data नहीं मिला"
-        )
-
-    HISTORY_CACHE["date"] = today
-    HISTORY_CACHE["data"] = result
-
-    return result
-
-
-# ---------------------------------------------------------
-# MAIN SCAN
-# ---------------------------------------------------------
-
-def scan():
-
-    with LOCK:
-
-        STATE["running"] = True
-        STATE["status"] = "Scan शुरू हो रहा है..."
-        STATE["results"] = []
-        STATE["error"] = None
-        STATE["last_scan"] = None
-        STATE["progress"] = 0
-        STATE["total"] = 0
-
-    try:
-
-        if not TOKEN:
-
-            raise RuntimeError(
-                "UPSTOX_ACCESS_TOKEN Render Environment में नहीं मिला"
-            )
-
-        # 1. Instruments
-        stocks = instruments()
-
-        # 2. Live quotes
-        quotes = live_quotes(stocks)
-
-        # -------------------------------------------------
-        # 3. PRELIMINARY SCORE
-        # -------------------------------------------------
-
-        status(
-            "Fast preliminary ranking बन रही है..."
-        )
-
-        preliminary = []
-
-        for stock in stocks:
-
-            symbol = stock["symbol"]
-
-            q = quotes.get(
-                "NSE_EQ:" + symbol
-            )
-
-            if not q:
+        for c in candles:
+            if len(c) < 6:
                 continue
 
             try:
+                close = float(c[4])
+                volume = float(c[5])
 
-                ltp = float(
-                    q["last_price"]
-                )
-
-                pc = float(
-                    q["prev_close_price"]
-                )
-
-                ohlc = q.get(
-                    "ohlc", {}
-                ) or {}
-
-                op = float(
-                    ohlc["open"]
-                )
-
-                low = float(
-                    ohlc["low"]
-                )
-
-                vol = float(
-                    q.get(
-                        "volume",
-                        0
-                    )
-                )
-
+                if close > 0 and volume >= 0:
+                    turnover = close * volume
+                    rows.append(turnover)
             except:
-
                 continue
 
-            if ltp < MIN_PRICE:
-                continue
+        # Latest 20 completed sessions.
+        rows = rows[-HISTORY_DAYS:]
+
+        if len(rows) < HISTORY_DAYS:
+            return key, None
+
+        avg_turnover = sum(rows) / len(rows)
+
+        return key, avg_turnover
+
+    except Exception:
+        return key, None
+
+
+def history_for_top(top):
+    today_key = datetime.now().date().isoformat()
+
+    if cache["history_date"] != today_key:
+        cache["history"] = {}
+        cache["history_date"] = today_key
+
+    todo = [
+        x for x in top
+        if x["key"] not in cache["history"]
+    ]
+
+    if todo:
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            futures = {
+                ex.submit(get_history, x): x
+                for x in todo
+            }
+
+            for f in as_completed(futures):
+                key, avg = f.result()
+                if avg is not None:
+                    cache["history"][key] = avg
+
+    return cache["history"]
+
+
+def final_score(x, avg_turnover):
+    op = x["open"]
+    low = x["low"]
+    ltp = x["ltp"]
+    prev = x["prev"]
+
+    gap = ((op - low) / op) * 100
+    recovery = ((ltp - low) / low) * 100
+    gain = ((ltp - prev) / prev) * 100
+
+    # --------------------------------------------------
+    # 1. OPEN-LOW GAP = 5%
+    # --------------------------------------------------
+    gap_score = max(
+        0.0,
+        (1 - gap / 0.50) * 100
+    )
+
+    # --------------------------------------------------
+    # 2. RECOVERY = 20%
+    # NO 100 CAP
+    # --------------------------------------------------
+    recovery_score = max(
+        0.0,
+        (recovery / 1.50) * 100
+    )
+
+    # --------------------------------------------------
+    # 3. GAIN = 35%
+    # NO 100 CAP
+    #
+    # Example:
+    # 3% gain  -> 100
+    # 6% gain  -> 200
+    # 14.44%   -> 481.33
+    # --------------------------------------------------
+    gain_score = max(
+        0.0,
+        (gain / 3.00) * 100
+    )
+
+    # --------------------------------------------------
+    # 4. LIVE TURNOVER = 30%
+    # NO 100 CAP
+    # --------------------------------------------------
+    live_turnover = x["volume"] * ltp
+
+    if avg_turnover > 0:
+        live_score = (
+            live_turnover /
+            (avg_turnover * LIVE_TURNOVER_MULTIPLIER)
+        ) * 100
+    else:
+        live_score = 0.0
+
+    live_score = max(0.0, live_score)
+
+    # --------------------------------------------------
+    # 5. AVERAGE TURNOVER = 10%
+    # NO 100 CAP
+    # --------------------------------------------------
+    avg_score = max(
+        0.0,
+        (avg_turnover / AVG_TURNOVER_BASE) * 100
+    )
+
+    raw = (
+        gap_score * 0.05 +
+        recovery_score * 0.20 +
+        gain_score * 0.35 +
+        live_score * 0.30 +
+        avg_score * 0.10
+    )
+
+    return {
+        "raw": raw,
+        "gap_score": gap_score,
+        "recovery_score": recovery_score,
+        "gain_score": gain_score,
+        "live_score": live_score,
+        "avg_score": avg_score,
+        "live_turnover": live_turnover
+    }
 
-            if op <= 0 or low <= 0 or pc <= 0:
-                continue
-
-            sg = gap_score(
-                op,
-                low
-            )
-
-            sr = recovery_score(
-                ltp,
-                low
-            )
-
-            sgain = gain_score(
-                ltp,
-                pc
-            )
-
-            # Average-turnover component is
-            # temporarily neutral.
-            #
-            # It will be added after historical
-            # data is obtained for the strongest
-            # candidates.
-
-            live_turnover = vol * ltp
-
-            # Preliminary score = 90%
-            preliminary_score = (
-                sg * WGAP
-                + sr * WREC
-                + sgain * WGAIN
-                + clamp(
-                    live_turnover /
-                    250000000 * 100
-                ) * WLIVE
-            )
-
-            preliminary.append({
-
-                "stock": stock,
-
-                "symbol": symbol,
-
-                "ltp": ltp,
-
-                "pc": pc,
-
-                "open": op,
-
-                "low": low,
-
-                "volume": vol,
-
-                "gap": sg,
-
-                "recovery": sr,
-
-                "gain": sgain,
-
-                "live_turnover":
-                    live_turnover,
-
-                "preliminary":
-                    preliminary_score
-            })
-
-        if not preliminary:
-
-            raise RuntimeError(
-                "₹50+ वाले live candidates नहीं मिले"
-            )
-
-        preliminary.sort(
-            key=lambda x:
-                x["preliminary"],
-            reverse=True
-        )
-
-        # -------------------------------------------------
-        # 4. ONLY TOP 250 HISTORICAL DATA
-        # -------------------------------------------------
-
-        top = preliminary[
-            :TOP_HISTORY
-        ]
-
-        candidates = [
-            x["stock"]
-            for x in top
-        ]
-
-        average_turnovers = (
-            historical_top(
-                candidates
-            )
-        )
-
-        # -------------------------------------------------
-        # 5. FINAL SCORE
-        # -------------------------------------------------
-
-        status(
-            "Final Strength Ranking तैयार हो रही है..."
-        )
-
-        results = []
-
-        for x in top:
-
-            symbol = x["symbol"]
-
-            average = (
-                average_turnovers.get(
-                    symbol
-                )
-            )
-
-            if not average:
-                continue
-
-            savg = avg_score(
-                average
-            )
-
-            slive = live_score(
-                x["live_turnover"],
-                average
-            )
-
-            final_score = (
-
-                x["gap"]
-                * WGAP
-
-                + x["recovery"]
-                * WREC
-
-                + x["gain"]
-                * WGAIN
-
-                + slive
-                * WLIVE
-
-                + savg
-                * WAVG
-            )
-
-            gain_percent = (
-                (x["ltp"] - x["pc"])
-                / x["pc"]
-            ) * 100
-
-            results.append({
-
-                "symbol":
-                    symbol,
-
-                "strength":
-                    round(
-                        final_score,
-                        2
-                    ),
-
-                "ltp":
-                    round(
-                        x["ltp"],
-                        2
-                    ),
-
-                "open":
-                    round(
-                        x["open"],
-                        2
-                    ),
-
-                "low":
-                    round(
-                        x["low"],
-                        2
-                    ),
-
-                "gain":
-                    round(
-                        gain_percent,
-                        2
-                    ),
-
-                "avg_turnover":
-                    round(
-                        average,
-                        0
-                    )
-            })
-
-        results.sort(
-            key=lambda x:
-                x["strength"],
-            reverse=True
-        )
-
-        for i, x in enumerate(
-            results,
-            1
-        ):
-
-            x["rank"] = i
-
-        with LOCK:
-
-            STATE["results"] = results
-
-            STATE["last_scan"] = (
-                now().strftime(
-                    "%d-%m-%Y %H:%M:%S"
-                )
-            )
-
-            STATE["status"] = (
-                f"Scan complete — "
-                f"{len(results)} stocks found"
-            )
-
-            STATE["progress"] = (
-                len(candidates)
-            )
-
-            STATE["total"] = (
-                len(candidates)
-            )
-
-    except Exception as e:
-
-        with LOCK:
-
-            STATE["error"] = str(e)
-
-            STATE["status"] = (
-                "ERROR: " + str(e)
-            )
-
-    finally:
-
-        with LOCK:
-            STATE["running"] = False
-
-
-# ---------------------------------------------------------
-# HTML
-# ---------------------------------------------------------
-
-HTML = """
-<!DOCTYPE html>
-<html lang="hi">
-
-<head>
-
-<meta charset="UTF-8">
-
-<meta name="viewport"
-content="width=device-width,initial-scale=1.0">
-
-<title>Early Strength Rank Scanner</title>
-
-<style>
-
-*{
-box-sizing:border-box;
-}
-
-body{
-margin:0;
-padding:12px;
-background:#0e141b;
-color:#e8edf3;
-font-family:Arial,Helvetica,sans-serif;
-}
-
-.container{
-max-width:1000px;
-margin:auto;
-}
-
-.header,.panel{
-background:#151d26;
-border:1px solid #27313c;
-border-radius:18px;
-padding:20px;
-margin-bottom:18px;
-}
-
-h1{
-margin:0 0 8px;
-font-size:28px;
-}
-
-.subtitle{
-color:#9ca8b5;
-font-size:17px;
-}
-
-.status{
-background:#1c2732;
-border-radius:12px;
-padding:16px;
-font-size:18px;
-margin-bottom:12px;
-}
-
-.progress{
-height:8px;
-background:#27313c;
-border-radius:10px;
-overflow:hidden;
-margin-top:12px;
-}
-
-.progressbar{
-height:100%;
-width:0%;
-background:#3b82f6;
-transition:width .3s;
-}
-
-button{
-background:#2563b9;
-color:white;
-border:0;
-border-radius:10px;
-padding:14px 24px;
-font-size:17px;
-}
-
-button:disabled{
-opacity:.5;
-}
-
-.weights{
-display:grid;
-grid-template-columns:repeat(2,1fr);
-gap:12px;
-margin-bottom:18px;
-}
-
-.box{
-background:#1b2631;
-border-radius:12px;
-padding:16px;
-}
-
-.label{
-color:#9ca8b5;
-margin-bottom:6px;
-}
-
-.value{
-font-size:22px;
-font-weight:bold;
-}
-
-.results-title{
-font-size:25px;
-font-weight:bold;
-margin-bottom:18px;
-}
-
-.table-wrap{
-overflow-x:auto;
-}
-
-table{
-width:100%;
-border-collapse:collapse;
-min-width:650px;
-}
-
-th,td{
-padding:12px 10px;
-border-bottom:1px solid #27313c;
-text-align:left;
-}
-
-th{
-color:#aeb8c3;
-}
-
-.error{
-color:#ff8d8d;
-background:#321b1b;
-padding:12px;
-border-radius:10px;
-margin-top:12px;
-}
-
-.note{
-color:#9ca8b5;
-font-size:14px;
-line-height:1.5;
-}
-
-</style>
-
-</head>
-
-<body>
-
-<div class="container">
-
-<div class="header">
-
-<h1>
-Early Strength Rank Scanner
-</h1>
-
-<div class="subtitle">
-NSE EQ • Live Strength Ranking • Strongest First
-</div>
-
-</div>
-
-
-<div class="panel">
-
-<div id="status"
-class="status">
-Ready
-</div>
-
-<div>
-Last Scan:
-<strong id="lastScan">--</strong>
-</div>
-
-<div class="progress">
-
-<div id="bar"
-class="progressbar">
-</div>
-
-</div>
-
-<br>
-
-<button id="scanBtn"
-onclick="startScan()">
-Scan Now
-</button>
-
-<div id="error"></div>
-
-</div>
-
-
-<div class="weights">
-
-<div class="box">
-<div class="label">Price</div>
-<div class="value">≥ ₹50</div>
-</div>
-
-<div class="box">
-<div class="label">Gap Weight</div>
-<div class="value">5%</div>
-</div>
-
-<div class="box">
-<div class="label">Recovery</div>
-<div class="value">20%</div>
-</div>
-
-<div class="box">
-<div class="label">Gain</div>
-<div class="value">35%</div>
-</div>
-
-<div class="box">
-<div class="label">Live Turnover</div>
-<div class="value">30%</div>
-</div>
-
-<div class="box">
-<div class="label">Average Turnover</div>
-<div class="value">10%</div>
-</div>
-
-</div>
-
-
-<div class="panel">
-
-<div class="results-title">
-Results: <span id="count">0</span>
-</div>
-
-<div class="table-wrap">
-
-<table>
-
-<thead>
-
-<tr>
-<th>Rank</th>
-<th>Share</th>
-<th>Strength</th>
-<th>LTP</th>
-<th>Open</th>
-<th>Low</th>
-<th>Gain</th>
-</tr>
-
-</thead>
-
-<tbody id="tbody">
-
-<tr>
-<td colspan="7">
-कोई result नहीं
-</td>
-</tr>
-
-</tbody>
-
-</table>
-
-</div>
-
-</div>
-
-
-<div class="panel">
-
-<h2>Ranking Logic</h2>
-
-<p>• NSE Equity shares only</p>
-<p>• Price ≥ ₹50</p>
-<p>• Open-Low Gap = 5%</p>
-<p>• Recovery = 20%</p>
-<p>• Gain = 35%</p>
-<p>• Live Turnover = 30%</p>
-<p>• Average Turnover = 10%</p>
-
-<p class="note">
-Fast scan में पहले strongest live candidates
-निकाले जाते हैं। 20-Day Average Turnover
-केवल Top 250 candidates पर calculate होता है,
-जिससे scanner बहुत तेज चलता है।
-</p>
-
-</div>
-
-</div>
-
-
-<script>
-
-async function load(){
-
-try{
-
-const r=await fetch(
-"/api/results",
-{cache:"no-store"}
-);
-
-const d=await r.json();
-
-document.getElementById(
-"status"
-).innerText=
-d.status||"Ready";
-
-document.getElementById(
-"lastScan"
-).innerText=
-d.last_scan||"--";
-
-document.getElementById(
-"count"
-).innerText=
-d.results?d.results.length:0;
-
-document.getElementById(
-"scanBtn"
-).disabled=d.running;
-
-if(d.error){
-
-document.getElementById(
-"error"
-).innerHTML=
-'<div class="error">'+
-d.error+
-'</div>';
-
-}else{
-
-document.getElementById(
-"error"
-).innerHTML="";
-}
-
-let p=0;
-
-if(d.total>0){
-
-p=(d.progress/d.total)*100;
-
-}
-
-document.getElementById(
-"bar"
-).style.width=
-p+"%";
-
-
-const tbody=
-document.getElementById(
-"tbody"
-);
-
-if(!d.results||
-d.results.length===0){
-
-tbody.innerHTML=
-'<tr><td colspan="7">'+
-'कोई result नहीं'+
-'</td></tr>';
-
-return;
-}
-
-tbody.innerHTML=
-d.results.map(x=>`
-
-<tr>
-
-<td>
-<strong>${x.rank}</strong>
-</td>
-
-<td>
-<strong>${x.symbol}</strong>
-</td>
-
-<td>
-<strong>${x.strength}</strong>
-</td>
-
-<td>
-₹${x.ltp}
-</td>
-
-<td>
-₹${x.open}
-</td>
-
-<td>
-₹${x.low}
-</td>
-
-<td>
-${x.gain}%
-</td>
-
-</tr>
-
-`).join("");
-
-}catch(e){
-
-document.getElementById(
-"status"
-).innerText=
-"Server response नहीं मिला";
-
-}
-
-}
-
-
-async function startScan(){
-
-document.getElementById(
-"scanBtn"
-).disabled=true;
-
-document.getElementById(
-"status"
-).innerText=
-"Scan शुरू हो रहा है...";
-
-document.getElementById(
-"error"
-).innerHTML="";
-
-try{
-
-await fetch(
-"/api/scan",
-{
-method:"POST"
-}
-);
-
-}catch(e){
-
-document.getElementById(
-"status"
-).innerText=
-"Scan request failed";
-
-}
-
-}
-
-
-load();
-
-setInterval(
-load,
-1500
-);
-
-</script>
-
-</body>
-
-</html>
-"""
-
-
-# ---------------------------------------------------------
-# ROUTES
-# ---------------------------------------------------------
 
 @app.route("/")
 def home():
     return render_template_string(HTML)
 
 
-@app.route(
-    "/api/scan",
-    methods=["POST"]
-)
-def api_scan():
+@app.route("/scan")
+def scan():
+    if not TOKEN:
+        return jsonify({
+            "error": "UPSTOX_ACCESS_TOKEN Render में उपलब्ध नहीं है."
+        }), 500
 
-    with LOCK:
+    try:
+        cache["status"] = "Loading instruments..."
 
-        if STATE["running"]:
+        instruments = load_instruments()
 
+        cache["status"] = (
+            f"{len(instruments)} NSE EQ instruments loaded"
+        )
+
+        quotes = get_quotes(instruments)
+
+        if not quotes:
             return jsonify({
-                "ok": True,
-                "message":
-                    "Scan already running"
+                "error": "Upstox से valid NSE EQ quotes नहीं मिले."
+            }), 500
+
+        # ---------------------------------------------
+        # FAST PRE-SCAN
+        # ---------------------------------------------
+        for x in quotes:
+            x["_pre"] = preliminary_score(x)
+
+        quotes.sort(
+            key=lambda x: x["_pre"],
+            reverse=True
+        )
+
+        top = quotes[:TOP_HISTORY]
+
+        cache["status"] = (
+            f"20-Day turnover: 0/{len(top)}"
+        )
+
+        hist = history_for_top(top)
+
+        final = []
+
+        for x in top:
+            avg = hist.get(x["key"])
+
+            if avg is None:
+                continue
+
+            fs = final_score(x, avg)
+
+            gain = (
+                (x["ltp"] - x["prev"]) /
+                x["prev"] * 100
+            )
+
+            final.append({
+                "symbol": x["symbol"],
+                "ltp": x["ltp"],
+                "open": x["open"],
+                "low": x["low"],
+                "gain": gain,
+                "avg_turnover": avg,
+                "live_turnover": fs["live_turnover"],
+                "raw": fs["raw"]
             })
 
-    threading.Thread(
-        target=scan,
-        daemon=True
-    ).start()
+        if not final:
+            return jsonify({
+                "error":
+                "Top candidates में 20-day historical turnover उपलब्ध नहीं हुआ."
+            }), 500
 
-    return jsonify({
-        "ok": True
-    })
+        # ------------------------------------------------
+        # ACTUAL RANKING
+        # ------------------------------------------------
+        #
+        # पहले RAW SCORE.
+        #
+        # फिर tie-break:
+        # 1. Gain
+        # 2. Live Turnover
+        # 3. Recovery
+        # 4. Average Turnover
+        #
+        # इसलिए समान rounded score होने पर भी
+        # stronger share ऊपर आएगा.
+        # ------------------------------------------------
 
+        final.sort(
+            key=lambda x: (
+                x["raw"],
+                x["gain"],
+                x["live_turnover"],
+                (x["ltp"] - x["low"]) / x["low"],
+                x["avg_turnover"]
+            ),
+            reverse=True
+        )
 
-@app.route("/api/results")
-def api_results():
+        # ---------------------------------------------
+        # DISPLAY STRENGTH
+        # ---------------------------------------------
+        #
+        # Raw score से ranking होती है.
+        # Display के लिए सबसे मजबूत को 100.
+        #
+        # इससे 100-100 की समस्या खत्म होती है,
+        # क्योंकि ranking raw score से होती है.
+        # ---------------------------------------------
 
-    with LOCK:
+        max_raw = max(x["raw"] for x in final)
+
+        for x in final:
+            if max_raw > 0:
+                x["strength"] = (
+                    x["raw"] / max_raw
+                ) * 100
+            else:
+                x["strength"] = 0
+
+            # Internal raw score UI में नहीं दिखाना.
+            del x["raw"]
+
+        now = datetime.now().strftime(
+            "%d-%m-%Y %H:%M:%S"
+        )
+
+        cache["results"] = final
+        cache["status"] = f"Completed: {len(final)} results"
 
         return jsonify({
-            "running":
-                STATE["running"],
-
-            "status":
-                STATE["status"],
-
-            "last_scan":
-                STATE["last_scan"],
-
-            "results":
-                STATE["results"],
-
-            "error":
-                STATE["error"],
-
-            "progress":
-                STATE["progress"],
-
-            "total":
-                STATE["total"]
+            "time": now,
+            "results": final
         })
+
+    except Exception as e:
+        cache["status"] = "Error"
+
+        return jsonify({
+            "error": str(e)
+        }), 500
 
 
 if __name__ == "__main__":
-
     app.run(
         host="0.0.0.0",
-        port=int(
-            os.getenv(
-                "PORT",
-                "5000"
-            )
-        )
+        port=int(os.getenv("PORT", "10000"))
     )
